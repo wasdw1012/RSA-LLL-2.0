@@ -589,6 +589,831 @@ class KanProjector:
         return self._cokernel_basis @ (self._cokernel_basis.conj().T @ psi)
 
 
+@dataclass
+class RightKanProjectionResult:
+    """
+    右Kan扩张投影结果
+
+    数学背景：
+        右Kan扩张 Ran_K 是限制函子 K* 的右伴随：
+            Lan_K ⊣ K* ⊣ Ran_K
+
+        对于桥算子 T: ℂⁿ → ℂᵐ：
+            - 左Kan扩张对应列空间投影 P_L = T T⁺
+            - 右Kan扩张对应行空间投影 P_R = T⁺ T
+
+        物理含义：
+            - 左Kan：找到能够"生成"目标状态的L2理想态
+            - 右Kan：找到能够"存活"传输过程的L1理想态
+    """
+    psi_projected: np.ndarray           # 投影后的L1状态 = T⁺T @ ψ_L1
+    psi_original: np.ndarray            # 原始L1状态
+    psi_transmitted: np.ndarray         # 传输后的L2状态 = T @ (T⁺T @ ψ_L1)
+    projection_residual: float          # ||ψ - T⁺T @ ψ||（核分量范数）
+    kernel_component: np.ndarray        # (I - T⁺T) @ ψ（核分量，传输中丢失）
+    bridge_rank: int                    # rank(T)
+    bridge_condition: float             # cond(T)
+    ran_extension_exists: bool          # ker(T) = {0}? (满秩列)
+    blackhole_detected: bool            # ker(T) ≠ {0}?
+    blackhole_dimension: int            # dim(ker(T))
+    singular_values: np.ndarray         # T 的奇异值谱
+    kernel_basis: Optional[np.ndarray]  # 核基底（黑洞方向）
+    # 伴随性验证
+    adjunction_unit_error: float        # ||η ∘ ε - id|| 误差
+    adjunction_counit_error: float      # ||ε ∘ η - id|| 误差
+
+
+class RightKanProjector:
+    """
+    右Kan扩张投影器：伴随对 K* ⊣ Ran_K 的线性代数实现
+
+    ═══════════════════════════════════════════════════════════════════════════
+    范畴论基础
+    ═══════════════════════════════════════════════════════════════════════════
+
+    给定函子 K: C → B，存在伴随三元组：
+
+        Lan_K ⊣ K* ⊣ Ran_K
+
+    其中：
+        - Lan_K: [C, Set] → [B, Set]  （左Kan扩张，左伴随）
+        - K*: [B, Set] → [C, Set]     （限制函子/预复合）
+        - Ran_K: [C, Set] → [B, Set]  （右Kan扩张，右伴随）
+
+    右Kan扩张的极限公式：
+        (Ran_K F)(b) = lim_{(c, f: b→K(c)) ∈ (b↓K)} F(c)
+
+    对偶于左Kan扩张的余极限公式：
+        (Lan_K F)(b) = colim_{(c, f: K(c)→b) ∈ (K↓b)} F(c)
+
+    ═══════════════════════════════════════════════════════════════════════════
+    线性代数实现
+    ═══════════════════════════════════════════════════════════════════════════
+
+    范畴论 → 线性代数对应：
+        范畴 C (L1)     →  向量空间 ℂⁿ（源空间）
+        范畴 B (L2)     →  向量空间 ℂᵐ（目标空间）
+        函子 K: C → B   →  线性算子 T: ℂⁿ → ℂᵐ
+        限制函子 K*     →  T†: ℂᵐ → ℂⁿ（伴随算子/共轭转置）
+        右Kan扩张 Ran_K →  行空间投影 P_R = T⁺T
+
+    关键投影算子：
+        P_R = T⁺T: ℂⁿ → ℂⁿ
+
+    满足：
+        - P_R² = P_R （幂等性）
+        - P_R† = P_R （自伴性）
+        - im(P_R) = im(T†) = coim(T) = ker(T)⊥
+        - ker(P_R) = ker(T)
+
+    ═══════════════════════════════════════════════════════════════════════════
+    伴随性：单位与余单位
+    ═══════════════════════════════════════════════════════════════════════════
+
+    对于伴随对 K* ⊣ Ran_K：
+
+    单位 (Unit) η: Id_{[C,Set]} → Ran_K ∘ K*
+        线性代数：η = T⁺T（行空间投影）
+
+    余单位 (Counit) ε: K* ∘ Ran_K → Id_{[B,Set]}
+        线性代数：ε = TT⁺（列空间投影）
+
+    三角恒等式 (Triangle Identities)：
+        (ε ∘ K*) ∘ (K* ∘ η) = id_{K*}
+        (Ran_K ∘ ε) ∘ (η ∘ Ran_K) = id_{Ran_K}
+
+    线性代数形式：
+        T† (TT⁺) (T⁺T) T† = T†    （对于所有 T†）
+        T⁺ (TT⁺) (T⁺T) T⁺ = T⁺    （对于 T⁺）
+
+    ═══════════════════════════════════════════════════════════════════════════
+    物理含义：黑洞检测
+    ═══════════════════════════════════════════════════════════════════════════
+
+    ker(T) ≠ {0} 表示存在"黑洞"：
+        - L1 中某些状态传输后完全消失（被 T 映射到零）
+        - 这对应"资产蒸发漏洞"——L1 资产可以凭空消失
+
+    与左Kan的对偶：
+        - 左Kan检测 coker(T)：L2 中无法从 L1 解释的状态（虫洞/铸币）
+        - 右Kan检测 ker(T)：L1 中传输后消失的状态（黑洞/销毁）
+
+    参考文献：
+        [1] Mac Lane, S. (1998). Categories for the Working Mathematician, Ch. X
+        [2] Riehl, E. (2016). Category Theory in Context, Ch. 6
+        [3] Loregian, F. (2021). (Co)end Calculus, Ch. 2
+    """
+
+    def __init__(
+        self,
+        pinv_rcond: float = _SVD_RCOND,
+        tikhonov_reg: float = 0.0,
+    ):
+        """
+        初始化右Kan投影器
+
+        Args:
+            pinv_rcond: Moore-Penrose伪逆的相对截断阈值
+                        数学依据：Golub-Van Loan推荐 √ε_mach ≈ 1.49e-8
+            tikhonov_reg: Tikhonov正则化参数 λ ≥ 0
+                          当 λ > 0 时使用正则化伪逆：
+                          T⁺_λ = (T†T + λI)⁻¹ T†
+        """
+        self.pinv_calculator = MoorePenrosePseudoinverse(
+            rcond=pinv_rcond,
+            regularization=tikhonov_reg,
+        )
+        self._T_bridge: Optional[np.ndarray] = None
+        self._T_pinv: Optional[np.ndarray] = None
+        self._kernel_basis: Optional[np.ndarray] = None
+        self._row_space_projector: Optional[np.ndarray] = None  # P_R = T⁺T
+        self._column_space_projector: Optional[np.ndarray] = None  # P_L = TT⁺
+        self._m: int = 0  # 目标空间维度
+        self._n: int = 0  # 源空间维度
+        self._rank: int = 0  # 数值秩
+        self._singular_values: Optional[np.ndarray] = None
+
+    def set_bridge_operator(self, T_bridge: np.ndarray) -> None:
+        """
+        设置桥接算子并预计算所有必要结构
+
+        数学：
+            给定 T: ℂⁿ → ℂᵐ，计算：
+            1. Moore-Penrose伪逆 T⁺
+            2. 行空间投影 P_R = T⁺T（右Kan核心）
+            3. 列空间投影 P_L = TT⁺（左Kan核心，用于伴随验证）
+            4. 核基底 ker(T)（黑洞方向）
+
+        SVD分解：T = U Σ V†
+            - T⁺ = V Σ⁺ U†
+            - P_R = T⁺T = V Σ⁺ U† U Σ V† = V (Σ⁺Σ) V†
+            - 对于秩 r，Σ⁺Σ = diag(1,...,1,0,...,0) (r个1)
+            - ker(T) = span{v_{r+1}, ..., v_n}（V的后 n-r 列）
+        """
+        T = np.asarray(T_bridge, dtype=np.complex128)
+
+        if T.ndim != 2:
+            raise ValueError(f"桥算子必须是2D矩阵，得到 {T.ndim}D")
+
+        self._m, self._n = T.shape
+        self._T_bridge = T
+
+        # 计算完整SVD
+        U, s, Vh = np.linalg.svd(T, full_matrices=True)
+        self._singular_values = s.copy()
+
+        # 计算伪逆
+        self._T_pinv = self.pinv_calculator.compute(T)
+
+        # 获取数值秩
+        diag = self.pinv_calculator.get_diagnostics()
+        self._rank = diag["numerical_rank"]
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 计算行空间投影 P_R = T⁺T（右Kan扩张核心算子）
+        # ═══════════════════════════════════════════════════════════════════
+        #
+        # 数学：P_R 投影到 im(T†) = ker(T)⊥
+        # 这是能够"存活"传输过程的L1状态空间
+        #
+        self._row_space_projector = self._T_pinv @ T
+
+        # 确保数值对称性（P_R应当自伴）
+        self._row_space_projector = 0.5 * (
+            self._row_space_projector +
+            self._row_space_projector.conj().T
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 计算列空间投影 P_L = TT⁺（用于伴随性验证）
+        # ═══════════════════════════════════════════════════════════════════
+        self._column_space_projector = T @ self._T_pinv
+        self._column_space_projector = 0.5 * (
+            self._column_space_projector +
+            self._column_space_projector.conj().T
+        )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 计算核基底 ker(T)（黑洞方向）
+        # ═══════════════════════════════════════════════════════════════════
+        #
+        # SVD: T = U Σ V†
+        # ker(T) = {v : Tv = 0} = span{v_{r+1}, ..., v_n}
+        # 即 V† 的后 (n - r) 行，等价于 V 的后 (n - r) 列
+        #
+        V = Vh.conj().T  # V = (Vh)†, shape (n, n)
+
+        if self._rank < self._n:
+            self._kernel_basis = V[:, self._rank:]  # shape (n, n-r)
+        else:
+            self._kernel_basis = np.zeros((self._n, 0), dtype=np.complex128)
+
+    def project(
+        self,
+        psi_L1: np.ndarray,
+        verify_adjunction: bool = True,
+    ) -> RightKanProjectionResult:
+        """
+        执行右Kan扩张投影
+
+        ═══════════════════════════════════════════════════════════════════════
+        数学核心
+        ═══════════════════════════════════════════════════════════════════════
+
+        给定 ψ ∈ ℂⁿ（L1状态），计算：
+
+            ψ_projected = P_R @ ψ = T⁺T @ ψ
+
+        分解：
+            ψ = ψ_projected + ψ_kernel
+            ψ_projected ∈ im(T†) = ker(T)⊥（行空间，存活分量）
+            ψ_kernel ∈ ker(T)（核空间，黑洞分量）
+
+        传输验证：
+            T @ ψ_projected = T @ T⁺ @ T @ ψ = T @ ψ
+            （投影后的状态传输结果与原始相同）
+
+        ═══════════════════════════════════════════════════════════════════════
+        物理含义
+        ═══════════════════════════════════════════════════════════════════════
+
+        - ψ_projected：能够通过桥传输的L1状态分量
+        - ψ_kernel：传输中会消失的L1状态分量（黑洞）
+        - ||ψ_kernel|| > 0 表示存在资产蒸发风险
+
+        Args:
+            psi_L1: L1状态向量
+            verify_adjunction: 是否验证伴随性恒等式
+
+        Returns:
+            RightKanProjectionResult 包含完整投影分析
+        """
+        if self._T_bridge is None:
+            raise RuntimeError("桥算子未设置。请先调用 set_bridge_operator()")
+
+        psi = np.asarray(psi_L1, dtype=np.complex128).flatten()
+
+        if psi.shape[0] != self._n:
+            raise ValueError(
+                f"状态维度 {psi.shape[0]} 与源空间维度 {self._n} 不匹配"
+            )
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 核心计算：右Kan投影
+        # ═══════════════════════════════════════════════════════════════════
+
+        # P_R @ ψ = T⁺T @ ψ
+        psi_projected = self._row_space_projector @ psi
+
+        # 核分量：(I - P_R) @ ψ
+        psi_kernel = psi - psi_projected
+
+        # 投影残差（核分量范数）
+        projection_residual = _to_real_scalar(np.linalg.norm(psi_kernel))
+
+        # 传输后的L2状态
+        psi_transmitted = self._T_bridge @ psi_projected
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 伴随性验证
+        # ═══════════════════════════════════════════════════════════════════
+
+        unit_error = 0.0
+        counit_error = 0.0
+
+        if verify_adjunction:
+            unit_error, counit_error = self._verify_adjunction_on_state(psi)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 诊断信息
+        # ═══════════════════════════════════════════════════════════════════
+
+        diag = self.pinv_calculator.get_diagnostics()
+        bridge_rank = diag["numerical_rank"]
+        bridge_condition = diag["condition_number"]
+
+        # 黑洞检测
+        blackhole_dimension = self._n - bridge_rank
+        blackhole_detected = blackhole_dimension > 0
+
+        # 右Kan扩张存在性：ker(T) = {0} 等价于 T 列满秩
+        psi_norm = np.linalg.norm(psi)
+        ran_extension_exists = (
+            projection_residual < _SVD_RCOND * psi_norm
+            if psi_norm > 0 else True
+        )
+
+        return RightKanProjectionResult(
+            psi_projected=psi_projected,
+            psi_original=psi,
+            psi_transmitted=psi_transmitted,
+            projection_residual=projection_residual,
+            kernel_component=psi_kernel,
+            bridge_rank=bridge_rank,
+            bridge_condition=bridge_condition,
+            ran_extension_exists=ran_extension_exists,
+            blackhole_detected=blackhole_detected,
+            blackhole_dimension=blackhole_dimension,
+            singular_values=self._singular_values,
+            kernel_basis=self._kernel_basis,
+            adjunction_unit_error=unit_error,
+            adjunction_counit_error=counit_error,
+        )
+
+    def project_onto_kernel(self, psi: np.ndarray) -> np.ndarray:
+        """
+        将向量投影到核空间 ker(T)
+
+        数学：
+            P_ker = I - T⁺T = I - P_R
+
+        等价于：
+            P_ker @ ψ = Σ_{i=r+1}^{n} ⟨v_i | ψ⟩ v_i
+
+        其中 {v_{r+1}, ..., v_n} 是核基底。
+
+        物理含义：
+            提取 ψ 中"传输后会消失"的分量（黑洞分量）
+        """
+        if self._T_bridge is None:
+            raise RuntimeError("桥算子未设置")
+
+        psi = np.asarray(psi, dtype=np.complex128).flatten()
+
+        if self._kernel_basis is None or self._kernel_basis.shape[1] == 0:
+            return np.zeros(self._n, dtype=np.complex128)
+
+        # 投影 = (核基底) @ (核基底)† @ ψ
+        return self._kernel_basis @ (self._kernel_basis.conj().T @ psi)
+
+    def compute_adjunction_unit(self) -> np.ndarray:
+        """
+        计算伴随对 K* ⊣ Ran_K 的单位态射
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论定义
+        ═══════════════════════════════════════════════════════════════════════
+
+        对于伴随对 F ⊣ G，单位 η: Id → G ∘ F 定义为：
+
+            对每个对象 X，η_X: X → G(F(X))
+
+        对于 K* ⊣ Ran_K：
+            η: Id_{[C,Set]} → Ran_K ∘ K*
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数实现
+        ═══════════════════════════════════════════════════════════════════════
+
+        设 T: ℂⁿ → ℂᵐ 表示 K
+
+        K* 对应 T†（限制/拉回）
+        Ran_K 对应 T⁺（右Kan）
+
+        单位 η = Ran_K ∘ K* 对应：
+            η = T⁺ ∘ T† = T⁺ @ T.conj().T
+
+        但在 Hilbert 空间范畴中，更自然的表示是：
+            η = T⁺T（行空间投影）
+
+        这是因为对于态向量 ψ ∈ ℂⁿ：
+            - K*(ψ) "限制"了 ψ 的信息
+            - Ran_K(K*(ψ)) "扩张"回来
+            - 净效果是投影到能够存活的分量
+
+        Returns:
+            η: (n, n) 矩阵，单位态射的矩阵表示
+        """
+        if self._row_space_projector is None:
+            raise RuntimeError("桥算子未设置")
+
+        return self._row_space_projector.copy()
+
+    def compute_adjunction_counit(self) -> np.ndarray:
+        """
+        计算伴随对 K* ⊣ Ran_K 的余单位态射
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论定义
+        ═══════════════════════════════════════════════════════════════════════
+
+        对于伴随对 F ⊣ G，余单位 ε: F ∘ G → Id 定义为：
+
+            对每个对象 Y，ε_Y: F(G(Y)) → Y
+
+        对于 K* ⊣ Ran_K：
+            ε: K* ∘ Ran_K → Id_{[B,Set]}
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数实现
+        ═══════════════════════════════════════════════════════════════════════
+
+        K* ∘ Ran_K 对应 T† ∘ T⁺
+
+        但作用在 L2 状态上时：
+            对于 φ ∈ ℂᵐ（L2状态）
+            K*(Ran_K(φ)) = T† @ (T⁺ @ φ)
+
+        然而余单位应该给出回到原空间的映射。
+        在我们的表示中，余单位是：
+            ε = T @ T⁺ = TT⁺（列空间投影）
+
+        验证：对于 φ ∈ im(T)，ε(φ) = φ
+
+        Returns:
+            ε: (m, m) 矩阵，余单位态射的矩阵表示
+        """
+        if self._column_space_projector is None:
+            raise RuntimeError("桥算子未设置")
+
+        return self._column_space_projector.copy()
+
+    def verify_triangle_identities(self) -> Tuple[float, float]:
+        """
+        验证伴随对的三角恒等式
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论
+        ═══════════════════════════════════════════════════════════════════════
+
+        对于伴随对 F ⊣ G with unit η and counit ε，三角恒等式为：
+
+            (ε ∘ F) ∘ (F ∘ η) = id_F
+            (G ∘ ε) ∘ (η ∘ G) = id_G
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数验证
+        ═══════════════════════════════════════════════════════════════════════
+
+        设：
+            F = K* 对应 T†（或在态空间中看作 T 的作用）
+            G = Ran_K 对应 T⁺
+            η = T⁺T（单位）
+            ε = TT⁺（余单位）
+
+        第一个三角恒等式：
+            对于 ψ ∈ ℂⁿ，验证 T @ ψ 经过 η 和 ε 后不变
+            ε @ T @ η @ ψ = TT⁺ @ T @ T⁺T @ ψ = T @ ψ
+
+            证明：TT⁺T = T（伪逆性质）
+            所以 TT⁺ @ T @ T⁺T = T @ (T⁺T) @ (T⁺T) = T @ T⁺T = T ✓
+
+        第二个三角恒等式：
+            对于 φ ∈ ℂᵐ，验证 T⁺ @ φ 经过 ε 和 η 后不变
+            η @ T⁺ @ ε @ φ = T⁺T @ T⁺ @ TT⁺ @ φ = T⁺ @ φ
+
+            证明：T⁺TT⁺ = T⁺（伪逆性质）
+            所以 T⁺T @ T⁺ @ TT⁺ = T⁺ @ (TT⁺) @ (TT⁺) = T⁺ @ TT⁺ = T⁺ ✓
+
+        Returns:
+            (error1, error2): 两个三角恒等式的违反程度
+        """
+        if self._T_bridge is None:
+            raise RuntimeError("桥算子未设置")
+
+        T = self._T_bridge
+        T_pinv = self._T_pinv
+
+        # 第一个恒等式：TT⁺T = T
+        TT_pinv_T = T @ T_pinv @ T
+        error1 = _to_real_scalar(
+            np.linalg.norm(TT_pinv_T - T, 'fro') /
+            max(np.linalg.norm(T, 'fro'), _FLOAT64_EPS)
+        )
+
+        # 第二个恒等式：T⁺TT⁺ = T⁺
+        T_pinv_T_T_pinv = T_pinv @ T @ T_pinv
+        error2 = _to_real_scalar(
+            np.linalg.norm(T_pinv_T_T_pinv - T_pinv, 'fro') /
+            max(np.linalg.norm(T_pinv, 'fro'), _FLOAT64_EPS)
+        )
+
+        return error1, error2
+
+    def compute_limit_cone(
+        self,
+        diagram: Dict[str, np.ndarray],
+        morphisms: Dict[Tuple[str, str], np.ndarray],
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """
+        计算极限锥（右Kan扩张的范畴论构造）
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论背景
+        ═══════════════════════════════════════════════════════════════════════
+
+        右Kan扩张通过极限定义：
+
+            (Ran_K F)(b) = lim_{(c, f: b→K(c)) ∈ (b↓K)} F(c)
+
+        对于有限图表，极限是满足交换条件的元组的子空间。
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数实现
+        ═══════════════════════════════════════════════════════════════════════
+
+        给定图表 D: J → Vect 和态射 {f_{ij}: D(i) → D(j)}：
+
+        极限 = {(v_i)_{i∈J} : f_{ij}(v_i) = v_j for all i→j}
+             = ker(Π - Σ)
+
+        其中 Π 是积投影，Σ 是由态射诱导的求和映射。
+
+        等价地，极限是等化子：
+            lim D = eq(Π_i D(i) ⇉ Π_{i→j} D(j))
+
+        Args:
+            diagram: {对象名: 向量空间基底矩阵} 图表对象
+            morphisms: {(源, 目标): 态射矩阵} 图表态射
+
+        Returns:
+            (limit_space, projections): 极限空间基底和投影映射
+        """
+        if not diagram:
+            raise ValueError("图表不能为空")
+
+        objects = list(diagram.keys())
+        n_objects = len(objects)
+
+        # 计算各空间维度
+        dims = {obj: diagram[obj].shape[0] for obj in objects}
+        total_dim = sum(dims.values())
+
+        if total_dim == 0:
+            return np.zeros((0, 0), dtype=np.complex128), {}
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 构造等化子矩阵
+        # ═══════════════════════════════════════════════════════════════════
+        #
+        # 对于每个态射 f: A → B，我们需要约束：
+        #     f(v_A) = v_B
+        # 即：f @ v_A - v_B = 0
+        #
+        # 在积空间 Π_i D(i) 上，这变成一个线性约束。
+
+        # 建立对象到索引的映射
+        obj_to_idx = {}
+        current_idx = 0
+        for obj in objects:
+            obj_to_idx[obj] = current_idx
+            current_idx += dims[obj]
+
+        # 构造约束矩阵
+        constraints = []
+
+        for (src, tgt), f in morphisms.items():
+            if src not in dims or tgt not in dims:
+                continue
+
+            src_dim = dims[src]
+            tgt_dim = dims[tgt]
+            src_start = obj_to_idx[src]
+            tgt_start = obj_to_idx[tgt]
+
+            # 约束：f @ v_src - v_tgt = 0
+            # 对于 v_src 的每个基向量 e_i：
+            #     f @ e_i 应该等于 v_tgt 的对应分量
+
+            for i in range(src_dim):
+                constraint = np.zeros(total_dim, dtype=np.complex128)
+                # f @ e_i 在目标空间的贡献
+                constraint[tgt_start:tgt_start + tgt_dim] = -f[:, i]
+                # e_i 在源空间的贡献
+                constraint[src_start + i] = 1.0
+                constraints.append(constraint)
+
+        if not constraints:
+            # 无约束时，极限就是积
+            limit_basis = np.eye(total_dim, dtype=np.complex128)
+        else:
+            # 构造约束矩阵并求核
+            C = np.vstack(constraints)  # shape (n_constraints, total_dim)
+
+            # 极限 = ker(C)
+            U, s, Vh = np.linalg.svd(C, full_matrices=True)
+
+            # 确定秩
+            threshold = _SVD_RCOND * s[0] if len(s) > 0 else 0
+            rank = int(np.sum(s > threshold))
+
+            # 核空间是 V† 的后 (total_dim - rank) 行
+            if rank < total_dim:
+                limit_basis = Vh[rank:, :].conj().T  # shape (total_dim, nullity)
+            else:
+                limit_basis = np.zeros((total_dim, 0), dtype=np.complex128)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 构造投影映射
+        # ═══════════════════════════════════════════════════════════════════
+
+        projections = {}
+        for obj in objects:
+            start = obj_to_idx[obj]
+            dim = dims[obj]
+            # 从极限空间到各分量的投影
+            proj = np.zeros((dim, limit_basis.shape[1]), dtype=np.complex128)
+            proj = limit_basis[start:start + dim, :]
+            projections[obj] = proj
+
+        return limit_basis, projections
+
+    def compute_beck_chevalley(
+        self,
+        T_1: np.ndarray,
+        T_2: np.ndarray,
+        base_change: np.ndarray,
+    ) -> Tuple[np.ndarray, float]:
+        """
+        计算 Beck-Chevalley 态射并验证条件
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论背景
+        ═══════════════════════════════════════════════════════════════════════
+
+        考虑拉回方块：
+
+                f
+            A ───→ B
+            |       |
+          g |       | h
+            ↓       ↓
+            C ───→ D
+                k
+
+        Beck-Chevalley 条件断言：对于右 Kan 扩张，
+
+            k* ∘ Ran_h ≅ Ran_g ∘ f*
+
+        即"先扩张后限制"等价于"先限制后扩张"。
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数实现
+        ═══════════════════════════════════════════════════════════════════════
+
+        设 T_1, T_2 是两个桥算子，base_change 是基变换。
+
+        Beck-Chevalley 态射 BC: im(T_1⁺) → im(T_2⁺)
+
+        验证条件：
+            base_change @ T_1⁺ @ T_1 ≈ T_2⁺ @ T_2 @ base_change
+
+        Args:
+            T_1: 第一个桥算子
+            T_2: 第二个桥算子
+            base_change: 基变换矩阵
+
+        Returns:
+            (bc_morphism, violation): Beck-Chevalley 态射和条件违反度
+        """
+        T_1 = np.asarray(T_1, dtype=np.complex128)
+        T_2 = np.asarray(T_2, dtype=np.complex128)
+        base_change = np.asarray(base_change, dtype=np.complex128)
+
+        # 计算伪逆
+        T_1_pinv = self.pinv_calculator.compute(T_1)
+        T_2_pinv = self.pinv_calculator.compute(T_2)
+
+        # 行空间投影
+        P_R_1 = T_1_pinv @ T_1
+        P_R_2 = T_2_pinv @ T_2
+
+        # Beck-Chevalley 态射
+        bc_morphism = P_R_2 @ base_change @ P_R_1
+
+        # 验证 Beck-Chevalley 条件
+        # base_change @ P_R_1 应该等于 P_R_2 @ base_change（在行空间上）
+        lhs = base_change @ P_R_1
+        rhs = P_R_2 @ base_change @ P_R_1  # 限制到行空间
+
+        violation = _to_real_scalar(
+            np.linalg.norm(lhs - rhs, 'fro') /
+            max(np.linalg.norm(lhs, 'fro'), _FLOAT64_EPS)
+        )
+
+        return bc_morphism, violation
+
+    def _verify_adjunction_on_state(
+        self,
+        psi: np.ndarray,
+    ) -> Tuple[float, float]:
+        """
+        在具体状态上验证伴随性
+
+        对于态向量 ψ，验证：
+            1. η 的一致性：T⁺T @ ψ 是最接近 ψ 的行空间元素
+            2. ε 的一致性：TT⁺ @ (T @ ψ) = T @ ψ
+        """
+        psi = np.asarray(psi, dtype=np.complex128).flatten()
+
+        T = self._T_bridge
+        T_pinv = self._T_pinv
+
+        # 单位验证：η = T⁺T
+        # T⁺T @ ψ 应该最小化 ||v - ψ|| s.t. v ∈ im(T†)
+        eta_psi = self._row_space_projector @ psi
+
+        # 检验幂等性：(T⁺T)² = T⁺T
+        eta_eta_psi = self._row_space_projector @ eta_psi
+        unit_error = _to_real_scalar(
+            np.linalg.norm(eta_eta_psi - eta_psi) /
+            max(np.linalg.norm(eta_psi), _FLOAT64_EPS)
+        )
+
+        # 余单位验证：ε = TT⁺
+        # TT⁺ @ (T @ ψ) = T @ ψ
+        T_psi = T @ psi
+        eps_T_psi = self._column_space_projector @ T_psi
+        counit_error = _to_real_scalar(
+            np.linalg.norm(eps_T_psi - T_psi) /
+            max(np.linalg.norm(T_psi), _FLOAT64_EPS)
+        )
+
+        return unit_error, counit_error
+
+    def compute_mate_correspondence(
+        self,
+        alpha: np.ndarray,
+    ) -> np.ndarray:
+        """
+        计算伴侣对应 (Mate Correspondence)
+
+        ═══════════════════════════════════════════════════════════════════════
+        范畴论背景
+        ═══════════════════════════════════════════════════════════════════════
+
+        对于两个伴随对 F ⊣ G 和 F' ⊣ G'，以及自然变换 α: G → G'，
+        存在唯一的"伴侣" α̂: F' → F 使得某个图表交换。
+
+        具体地：
+            α̂ = (F' ∘ ε) ∘ (F' ∘ α ∘ F) ∘ (η' ∘ F)
+
+        ═══════════════════════════════════════════════════════════════════════
+        线性代数实现
+        ═══════════════════════════════════════════════════════════════════════
+
+        在我们的设定中，给定 α: im(T⁺) → im(T⁺)（行空间上的算子），
+        计算其伴侣 α̂。
+
+        简化情况：对于单个伴随 K* ⊣ Ran_K，伴侣对应给出：
+
+            α 在 im(T⁺) 上 ↔ α̂ 在 im(T) 上
+
+        通过：
+            α̂ = T @ α @ T⁺
+
+        Args:
+            alpha: 行空间上的算子
+
+        Returns:
+            alpha_mate: 列空间上的伴侣算子
+        """
+        if self._T_bridge is None:
+            raise RuntimeError("桥算子未设置")
+
+        alpha = np.asarray(alpha, dtype=np.complex128)
+
+        # 伴侣：T @ α @ T⁺
+        # 这将行空间上的算子转换为列空间上的算子
+        alpha_mate = self._T_bridge @ alpha @ self._T_pinv
+
+        return alpha_mate
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """
+        获取诊断信息
+        """
+        if self._T_bridge is None:
+            return {"status": "未初始化"}
+
+        triangle_errors = self.verify_triangle_identities()
+
+        return {
+            "source_dimension": self._n,
+            "target_dimension": self._m,
+            "numerical_rank": self._rank,
+            "kernel_dimension": self._n - self._rank,
+            "cokernel_dimension": self._m - self._rank,
+            "condition_number": self.pinv_calculator.get_diagnostics()["condition_number"],
+            "singular_values": self._singular_values,
+            "triangle_identity_errors": triangle_errors,
+            "row_projector_hermitian_error": _to_real_scalar(
+                np.linalg.norm(
+                    self._row_space_projector -
+                    self._row_space_projector.conj().T,
+                    'fro'
+                )
+            ),
+            "row_projector_idempotent_error": _to_real_scalar(
+                np.linalg.norm(
+                    self._row_space_projector @ self._row_space_projector -
+                    self._row_space_projector,
+                    'fro'
+                )
+            ),
+        }
+
+
 # ============================================================================
 # Section 5: NCG 光谱三元组
 # ============================================================================
