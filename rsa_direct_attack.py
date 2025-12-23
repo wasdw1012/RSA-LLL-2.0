@@ -255,6 +255,223 @@ def wiener_attack(n: int, e: int, *, verbose: bool = True) -> AttackResult:
     )
 
 
+def mvp_lll_wiener_attack(
+    n: int,
+    e: int,
+    *,
+    prime: int,
+    precision: int,
+    noise_tolerance: float = 0.0,
+    anchor_k: Optional[int] = None,
+    verbose: bool = True,
+) -> AttackResult:
+    """
+    MVP-style pipeline wrapper around the same *strict* Wiener verification.
+
+    What this does (deterministically):
+      - Stage A: build the canonical 2D approximation lattice for e/n:
+            L = span{ (n,0), (e,1) }
+        Any lattice vector is (u*n + v*e, v), giving a rational approximation
+        -u/v ≈ e/n when |u*n + v*e| is small.
+      - Stage B: reduce the basis using MVP19 LLL backend via `rsa_lll.lll_reduce_enhanced`
+        with Witt truncation controlled by (prime, precision).
+      - Stage C: extract candidate (k,d) pairs from reduced rows where u is integral
+        and validate them with the exact RSA algebra (same validator as Wiener).
+
+    Important:
+      - This does NOT assume "k can be any anchor". We only accept a candidate if
+        it yields integer (p,q) such that p*q=n. If nothing validates -> hard fail.
+    """
+    if n <= 0:
+        raise RSADirectAttackError(f"invalid n (must be positive), got n={n}")
+    if e <= 1:
+        raise RSADirectAttackError(f"invalid e (must be >1), got e={e}")
+    if math.gcd(e, n) != 1:
+        raise RSADirectAttackError("invalid public key: gcd(e, n) != 1")
+
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    log("=" * 70)
+    log("RSA direct attack — MVP19 LLL assisted Wiener (deterministic)")
+    log(f"[Input] n_bits={n.bit_length()}, e={e}, p={prime}, witt_k={precision}, noise_tol={noise_tolerance}")
+    if anchor_k is not None:
+        if int(anchor_k) == 0:
+            raise RSADirectAttackError("anchor_k must be non-zero (MSB cannot be empty)")
+        log(f"[Input] anchor_k={int(anchor_k)} (explicit; no auto-injection)")
+    log("=" * 70)
+
+    # Stage A: lattice construction (canonical 2D)
+    basis = [[int(n), 0], [int(e), 1]]
+
+    # Stage B: MVP19 LLL reduction + Witt truncation
+    try:
+        from rsa_lll import lll_reduce_enhanced
+    except Exception as ex:
+        raise RSADirectAttackError(f"failed to import rsa_lll: {ex}") from ex
+
+    lll_res = lll_reduce_enhanced(
+        basis,
+        prime=int(prime),
+        precision=int(precision),
+        noise_tolerance=float(noise_tolerance),
+        apply_witt_truncation=True,
+    )
+    if not lll_res.success:
+        return AttackResult(
+            success=False,
+            n=n,
+            e=e,
+            error=f"LLL reduction failed: {lll_res.error}",
+            diagnostics=AttackDiagnostics(
+                n_bits=n.bit_length(),
+                e_bits=e.bit_length(),
+                convergents_tested=0,
+                candidates_divisible=0,
+                candidates_square_discriminant=0,
+                elapsed_ms=float(lll_res.total_elapsed_ms),
+                notes={"lll_error": str(lll_res.error), "lll_diag": str(lll_res.diagnostics)},
+            ),
+        )
+
+    reduced = lll_res.reduced_basis
+    log(f"[StageB] LLL ok | reduced_rows={len(reduced)} | {lll_res.total_elapsed_ms:.1f}ms")
+    log(f"[StageB] LLL diag: {lll_res.diagnostics}")
+
+    # Stage C: derive (k,d) candidates from reduced basis rows.
+    # Each row is (x, v) with x = u*n + v*e. If (x - v*e) divisible by n then u integral.
+    # We'll collect either (k,d) pairs or just d values (if anchor_k is provided).
+    candidates: List[WienerCandidate] = []
+    d_only: List[int] = []
+    for row in reduced:
+        if len(row) != 2:
+            continue
+        x, v = int(row[0]), int(row[1])
+        if v == 0:
+            continue
+        num = x - v * e
+        if num % n != 0:
+            continue
+        u = num // n
+        k = abs(int(-u))
+        d = abs(int(v))
+        if k == 0 or d == 0:
+            continue
+        if anchor_k is None:
+            candidates.append(WienerCandidate(k=k, d=d))
+        else:
+            d_only.append(int(d))
+
+    # Also include the full convergent list (deterministic and complete).
+    # This ensures we don't "depend on luck" of a single reduced row.
+    cf = continued_fraction(e, n)
+    if anchor_k is None:
+        candidates.extend(list(convergents_from_cf(cf)))
+    else:
+        for cand in convergents_from_cf(cf):
+            if cand.d != 0:
+                d_only.append(int(cand.d))
+
+    if anchor_k is None:
+        # Deduplicate pairs while preserving order
+        seen = set()
+        uniq: List[WienerCandidate] = []
+        for c in candidates:
+            key = (c.k, c.d)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(c)
+        log(f"[StageC] candidate_pairs={len(uniq)} (lll_rows+convergents)")
+    else:
+        # Deduplicate d list while preserving order
+        seen_d = set()
+        uniq_d: List[int] = []
+        for d in d_only:
+            if d in seen_d:
+                continue
+            seen_d.add(d)
+            uniq_d.append(d)
+        log(f"[StageC] candidate_d_values={len(uniq_d)} (lll_rows+convergents) with fixed k={int(anchor_k)}")
+
+    # Validate candidates exactly (same algebra as wiener_attack)
+    t0 = time.perf_counter()
+    diag = AttackDiagnostics(n_bits=n.bit_length(), e_bits=e.bit_length())
+    diag.notes["mvp_lll"] = "used MVP19 LLL on 2D approximation lattice"
+    diag.notes["lll_diag"] = str(lll_res.diagnostics)
+
+    if anchor_k is None:
+        iterable_pairs = uniq
+    else:
+        iterable_pairs = [WienerCandidate(k=int(anchor_k), d=int(dv)) for dv in uniq_d]
+
+    for cand in iterable_pairs:
+        diag.convergents_tested += 1
+        k, d = int(cand.k), int(cand.d)
+        if k == 0 or d == 0:
+            continue
+        ed_minus_1 = e * d - 1
+        if ed_minus_1 % k != 0:
+            continue
+        diag.candidates_divisible += 1
+        phi = ed_minus_1 // k
+        if phi <= 0:
+            continue
+        s = n - phi + 1
+        disc = s * s - 4 * n
+        is_sq, sqrt_disc = _is_perfect_square(disc)
+        if not is_sq:
+            continue
+        diag.candidates_square_discriminant += 1
+        if (s + sqrt_disc) % 2 != 0:
+            continue
+        p = (s + sqrt_disc) // 2
+        q = (s - sqrt_disc) // 2
+        if p <= 1 or q <= 1:
+            continue
+        if p * q != n:
+            continue
+        if p < q:
+            p, q = q, p
+        phi_exact = (p - 1) * (q - 1)
+        d_exact = modinv(e, phi_exact)
+        if d_exact != d:
+            raise RSADirectAttackError("inconsistent candidate: d != invmod(e, phi(n))")
+
+        diag.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        log("[OK] candidate validated (p,q,d recovered)")
+        return AttackResult(
+            success=True,
+            n=n,
+            e=e,
+            d=d,
+            p=p,
+            q=q,
+            phi=phi_exact,
+            candidate=cand,
+            diagnostics=diag,
+            error=None,
+        )
+
+    diag.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    log("[FAIL] no candidate validated under strict algebraic checks")
+    log(f"[Diag] tested={diag.convergents_tested} divisible={diag.candidates_divisible} square_disc={diag.candidates_square_discriminant}")
+
+    return AttackResult(
+        success=False,
+        n=n,
+        e=e,
+        d=None,
+        p=None,
+        q=None,
+        phi=None,
+        candidate=None,
+        diagnostics=diag,
+        error="MVP-LLL-assisted Wiener validation found no (k,d) yielding integer factorization",
+    )
+
+
 def _parse_int_auto(s: str) -> int:
     s2 = s.strip().lower()
     if s2.startswith("0x"):
@@ -269,13 +486,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="RSA direct attack (Wiener small-d, deterministic)")
     parser.add_argument("--n", required=True, help="RSA modulus n (hex with/without 0x, or decimal)")
     parser.add_argument("--e", type=int, default=65537, help="public exponent e (default: 65537)")
+    parser.add_argument("--mvp", action="store_true", help="use MVP19 LLL-assisted pipeline (still strict validation)")
+    parser.add_argument("--prime", type=int, help="(MVP) truncation prime p (required with --mvp)")
+    parser.add_argument("--precision", type=int, help="(MVP) truncation precision k (required with --mvp)")
+    parser.add_argument("--noise", type=float, default=0.0, help="(MVP) noise tolerance (recorded; deterministic backend)")
+    parser.add_argument("--anchor-k", type=int, help="(MVP) explicit anchor k (non-zero). No auto-injection.")
     parser.add_argument("--quiet", action="store_true", help="suppress logs")
     args = parser.parse_args(argv)
 
     try:
         n = _parse_int_auto(args.n)
         e = int(args.e)
-        res = wiener_attack(n, e, verbose=(not args.quiet))
+        if args.mvp:
+            if args.prime is None or args.precision is None:
+                raise RSADirectAttackError("--mvp requires --prime and --precision")
+            res = mvp_lll_wiener_attack(
+                n,
+                e,
+                prime=int(args.prime),
+                precision=int(args.precision),
+                noise_tolerance=float(args.noise),
+                anchor_k=(int(args.anchor_k) if args.anchor_k is not None else None),
+                verbose=(not args.quiet),
+            )
+        else:
+            res = wiener_attack(n, e, verbose=(not args.quiet))
         if res.success:
             # machine-friendly one-liner (stable, no truncation)
             print(f"[RESULT] success=1 d={res.d} p={res.p} q={res.q}")
