@@ -1098,30 +1098,77 @@ class ECCollapsePressureTest:
 # Section 8: 白盒Smoke测试主入口
 # ===========================================================
 
+def tonelli_shanks(n: int, p: int) -> Optional[int]:
+    """Tonelli-Shanks算法求模p平方根"""
+    if n == 0:
+        return 0
+    if pow(n, (p - 1) // 2, p) != 1:
+        return None  # 非二次剩余
+
+    # 特殊情况: p ≡ 3 (mod 4)
+    if p % 4 == 3:
+        return pow(n, (p + 1) // 4, p)
+
+    # 一般情况
+    q = p - 1
+    s = 0
+    while q % 2 == 0:
+        q //= 2
+        s += 1
+
+    # 找一个非二次剩余
+    z = 2
+    while pow(z, (p - 1) // 2, p) != p - 1:
+        z += 1
+
+    m = s
+    c = pow(z, q, p)
+    t = pow(n, q, p)
+    r = pow(n, (q + 1) // 2, p)
+
+    while True:
+        if t == 1:
+            return r
+        i = 1
+        temp = t
+        while pow(temp, 2, p) != 1:
+            temp = pow(temp, 2, p)
+            i += 1
+            if i == m:
+                return None
+
+        b = pow(c, 1 << (m - i - 1), p)
+        m = i
+        c = pow(b, 2, p)
+        t = (t * c) % p
+        r = (r * b) % p
+
+
 def find_curve_points(curve: EllipticCurveParams, precision: int, count: int = 5) -> List[Tuple[int, int]]:
     """
     在椭圆曲线上寻找有效点
 
-    使用Tonelli-Shanks简化版：暴力搜索小范围内的二次剩余
+    使用Tonelli-Shanks算法高效求平方根
     """
     p = curve.p
-    pk = p ** min(precision, 4)  # 限制搜索范围
     points = []
 
-    for x in range(1, min(pk, 500)):
-        # y² = x³ + ax + b
-        y_sq = (pow(x, 3, pk) + curve.a * x + curve.b) % pk
+    for x in range(1, min(p * 10, 500)):
+        # y² = x³ + ax + b (mod p)
+        y_sq_mod_p = (pow(x, 3, p) + curve.a * x + curve.b) % p
 
-        # 暴力搜索平方根
-        for y in range(pk):
-            if pow(y, 2, pk) == y_sq:
-                # 验证完整精度
-                pt = ECPointPadic.from_ints(x, y, curve, precision)
+        # 用Tonelli-Shanks求平方根
+        y_mod_p = tonelli_shanks(y_sq_mod_p, p)
+
+        if y_mod_p is not None:
+            # 尝试提升到更高精度
+            for y_candidate in [y_mod_p, p - y_mod_p]:
+                pt = ECPointPadic.from_ints(x, y_candidate, curve, precision)
                 if pt.is_on_curve():
-                    points.append((x, y))
+                    points.append((x, y_candidate))
                     if len(points) >= count:
                         return points
-                break
+                    break
 
     return points
 
@@ -1312,6 +1359,319 @@ def run_whitebox_smoke_test():
     return passed_count == len(results)
 
 
+def run_boundary_stress_test():
+    """
+    边界爆破测试 - 往死里造
+
+    目标：
+    1. 找到系统的极限
+    2. 发现边界处的异常行为
+    3. 寻找可能的"惊喜"
+    """
+    print("=" * 70)
+    print("边界爆破测试 - 往死里造")
+    print("=" * 70)
+
+    results = []
+
+    # ================================================================
+    # 测试1: 极端大素数
+    # ================================================================
+    print("\n[爆破1] 极端大素数测试")
+    print("-" * 50)
+
+    large_primes = [251, 509, 1021, 2039, 4093]  # 大素数序列
+    for p in large_primes:
+        try:
+            curve = EllipticCurveParams(a=1, b=1, p=p)
+            precision = 4
+
+            # 尝试找点
+            pts = find_curve_points(curve, precision, count=2)
+            if len(pts) >= 2:
+                x1, y1 = pts[0]
+                x2, y2 = pts[1]
+                P = ECPointPadic.from_ints(x1, y1, curve, precision)
+                Q = ECPointPadic.from_ints(x2, y2, curve, precision)
+
+                prover = ECCollapseProver(curve, precision)
+                cert = prover.prove(P, Q)
+
+                print(f"  p={p}: 等价层级={cert.equivalence_level}/{precision}, "
+                      f"θ={float(cert.theta_degree):.4f}")
+                results.append(('large_prime', p, cert.equivalence_level))
+            else:
+                print(f"  p={p}: 曲线点稀疏，跳过")
+        except Exception as e:
+            print(f"  p={p}: 异常 - {type(e).__name__}: {e}")
+            results.append(('large_prime_error', p, str(e)))
+
+    # ================================================================
+    # 测试2: 极端高精度
+    # ================================================================
+    print("\n[爆破2] 极端高精度测试")
+    print("-" * 50)
+
+    p = 5
+    precisions = [8, 12, 16, 20, 24]
+    for k in precisions:
+        try:
+            curve = EllipticCurveParams(a=1, b=1, p=p)
+
+            # Witt向量在高精度下的表现
+            w1 = WittVector([1, 2, 3] + [0] * (k - 3), p)
+            w2 = WittVector([1, 2, 4] + [0] * (k - 3), p)
+
+            ghost1 = w1.ghost_vector()
+            ghost2 = w2.ghost_vector()
+
+            # 检查Ghost值是否溢出
+            max_ghost1 = max(ghost1)
+            max_ghost2 = max(ghost2)
+
+            print(f"  precision={k}: max_ghost={max(max_ghost1, max_ghost2)}, "
+                  f"层级2等价={w1.equiv_mod_nygaard(w2, 2)}")
+
+            # 检查Ghost差的模式
+            ghost_diff = [g1 - g2 for g1, g2 in zip(ghost1, ghost2)]
+            print(f"    Ghost差前4项: {ghost_diff[:4]}")
+
+            results.append(('high_precision', k, max_ghost1))
+
+        except Exception as e:
+            print(f"  precision={k}: 异常 - {type(e).__name__}: {e}")
+            results.append(('high_precision_error', k, str(e)))
+
+    # ================================================================
+    # 测试3: 塌缩边界搜索 - 寻找自然发生的部分塌缩
+    # ================================================================
+    print("\n[爆破3] 塌缩边界搜索 - 寻找自然部分塌缩")
+    print("-" * 50)
+
+    p = 5
+    precision = 8
+    curve = EllipticCurveParams(a=1, b=1, p=p)
+
+    # 大范围搜索曲线上的点对
+    all_points = find_curve_points(curve, precision, count=20)
+    print(f"  找到 {len(all_points)} 个曲线点")
+
+    collapse_found = []
+    for i in range(len(all_points)):
+        for j in range(i + 1, len(all_points)):
+            x1, y1 = all_points[i]
+            x2, y2 = all_points[j]
+
+            P = ECPointPadic.from_ints(x1, y1, curve, precision)
+            Q = ECPointPadic.from_ints(x2, y2, curve, precision)
+
+            prover = ECCollapseProver(curve, precision)
+            cert = prover.prove(P, Q)
+
+            if cert.equivalence_level > 0:
+                collapse_found.append((
+                    (x1, y1), (x2, y2),
+                    cert.equivalence_level,
+                    float(cert.log_shell_distance)
+                ))
+
+    if collapse_found:
+        print(f"  发现 {len(collapse_found)} 对部分塌缩的点!")
+        for p1, p2, level, dist in sorted(collapse_found, key=lambda x: -x[2])[:5]:
+            print(f"    P={p1}, Q={p2}: 层级={level}, Log-Shell={dist:.4f}")
+        results.append(('natural_collapse', len(collapse_found), collapse_found[0][2]))
+    else:
+        print("  未发现自然部分塌缩")
+        results.append(('natural_collapse', 0, 0))
+
+    # ================================================================
+    # 测试4: φV = p 关系的极端验证
+    # ================================================================
+    print("\n[爆破4] Frobenius-Verschiebung关系极端验证")
+    print("-" * 50)
+
+    for p in [3, 5, 7, 11]:
+        k = 10
+        try:
+            # 构造随机Witt向量
+            import random
+            random.seed(42)  # 可重现
+            components = [random.randint(0, p - 1) for _ in range(k)]
+            w = WittVector(components, p)
+
+            # φ(V(w))
+            Vw = w.verschiebung()
+            phiVw = Vw.frobenius()
+
+            # V(φ(w))
+            phiw = w.frobenius()
+            Vphiw = phiw.verschiebung()
+
+            # 验证 φV = Vφ (它们应该给出相同的效果)
+            match = phiVw.components == Vphiw.components
+
+            # Ghost层面验证
+            ghost_phiVw = phiVw.ghost_vector()
+            ghost_Vphiw = Vphiw.ghost_vector()
+            ghost_match = ghost_phiVw == ghost_Vphiw
+
+            print(f"  p={p}: φV=Vφ分量匹配={match}, Ghost匹配={ghost_match}")
+
+            if not match:
+                print(f"    φV(w)={phiVw.components[:5]}...")
+                print(f"    Vφ(w)={Vphiw.components[:5]}...")
+                results.append(('phiV_mismatch', p, 'ANOMALY'))
+            else:
+                results.append(('phiV', p, 'OK'))
+
+        except Exception as e:
+            print(f"  p={p}: 异常 - {e}")
+
+    # ================================================================
+    # 测试5: 零向量边界
+    # ================================================================
+    print("\n[爆破5] 零向量边界测试")
+    print("-" * 50)
+
+    p = 5
+    k = 6
+    zero_w = WittVector([0] * k, p)
+    nonzero_w = WittVector([1] + [0] * (k - 1), p)
+
+    # 零向量的Nygaard层级
+    zero_level = zero_w.nygaard_level()
+    print(f"  零向量Nygaard层级: {zero_level} (预期={k})")
+
+    # 零与非零的等价性
+    equiv_zero_nonzero = zero_w.equiv_mod_nygaard(nonzero_w, 0)
+    print(f"  0 ≡ 1 (mod N^{{≥0}})? {equiv_zero_nonzero} (预期=True，层级0无约束)")
+
+    # Frobenius作用于零
+    zero_frob = zero_w.frobenius()
+    print(f"  φ(0) = {zero_frob.components} (预期全0)")
+
+    # Verschiebung作用于零
+    zero_ver = zero_w.verschiebung()
+    print(f"  V(0) = {zero_ver.components} (预期全0)")
+
+    results.append(('zero_boundary', zero_level, k))
+
+    # ================================================================
+    # 测试6: 最大分量边界 (p-1)
+    # ================================================================
+    print("\n[爆破6] 最大分量边界测试 (全p-1)")
+    print("-" * 50)
+
+    p = 5
+    k = 6
+    max_w = WittVector([p - 1] * k, p)
+
+    print(f"  w = [{p-1}] * {k} = {max_w.components}")
+    print(f"  Ghost向量: {max_w.ghost_vector()}")
+
+    # Frobenius: (p-1)^p mod p = ?
+    max_frob = max_w.frobenius()
+    print(f"  φ(w) = {max_frob.components}")
+
+    # 自我等价验证
+    self_equiv = max_w.equiv_mod_nygaard(max_w, k)
+    print(f"  w ≡ w (mod N^{{≥{k}}})? {self_equiv}")
+
+    results.append(('max_components', max_w.ghost(0), 'OK'))
+
+    # ================================================================
+    # 测试7: 形式群参数边界 - y=0的情况
+    # ================================================================
+    print("\n[爆破7] 形式群参数边界 (y接近0)")
+    print("-" * 50)
+
+    p = 5
+    precision = 6
+    curve = EllipticCurveParams(a=1, b=1, p=p)
+    formal = FormalGroup(curve, precision)
+
+    # 寻找y很小的点
+    pk = p ** 4
+    small_y_points = []
+    for x in range(1, 200):
+        y_sq = (pow(x, 3, pk) + curve.a * x + curve.b) % pk
+        for y in range(p * 2):  # 只看小y
+            if pow(y, 2, pk) == y_sq:
+                pt = ECPointPadic.from_ints(x, y, curve, precision)
+                if pt.is_on_curve():
+                    small_y_points.append((x, y))
+                break
+
+    if small_y_points:
+        print(f"  找到 {len(small_y_points)} 个小y点")
+        for x, y in small_y_points[:3]:
+            pt = ECPointPadic.from_ints(x, y, curve, precision)
+            t = formal.point_to_local_param(pt)
+            print(f"    ({x},{y}) -> t = {t.to_int_mod_pk()} (赋值={t.valuation()})")
+    else:
+        print("  未找到小y点")
+
+    # ================================================================
+    # 测试8: 极端素数下的判别式检查
+    # ================================================================
+    print("\n[爆破8] 判别式边界 (坏约化)")
+    print("-" * 50)
+
+    # 寻找坏约化的情况
+    for p in [2, 3, 5, 7, 11, 31]:
+        for a in range(5):
+            for b in range(5):
+                curve = EllipticCurveParams(a=a, b=b, p=p)
+                disc = curve.discriminant()
+                if disc != 0 and disc % p == 0:
+                    print(f"  p={p}, a={a}, b={b}: Δ={disc}, 坏约化!")
+                    results.append(('bad_reduction', p, (a, b)))
+                    break
+            else:
+                continue
+            break
+
+    # ================================================================
+    # 统计
+    # ================================================================
+    print("\n" + "=" * 70)
+    print("边界爆破统计:")
+    print("=" * 70)
+
+    anomalies = [r for r in results if 'error' in r[0] or 'mismatch' in r[0] or 'ANOMALY' in str(r)]
+    surprises = [r for r in results if r[0] == 'natural_collapse' and r[1] > 0]
+
+    print(f"  总测试项: {len(results)}")
+    print(f"  异常/错误: {len(anomalies)}")
+    print(f"  惊喜发现: {len(surprises)}")
+
+    if anomalies:
+        print("\n  异常详情:")
+        for a in anomalies:
+            print(f"    {a}")
+
+    if surprises:
+        print("\n  惊喜详情:")
+        for s in surprises:
+            print(f"    自然部分塌缩: {s[1]}对点，最高层级={s[2]}")
+
+    return len(anomalies) == 0
+
+
 if __name__ == "__main__":
-    success = run_whitebox_smoke_test()
-    exit(0 if success else 1)
+    print("\n" + "#" * 70)
+    print("# 阶段1: 标准白盒Smoke测试")
+    print("#" * 70)
+    success1 = run_whitebox_smoke_test()
+
+    print("\n" + "#" * 70)
+    print("# 阶段2: 边界爆破测试")
+    print("#" * 70)
+    success2 = run_boundary_stress_test()
+
+    print("\n" + "=" * 70)
+    print(f"最终结果: 标准测试={'PASS' if success1 else 'FAIL'}, "
+          f"边界测试={'PASS' if success2 else 'FAIL'}")
+    print("=" * 70)
+
+    exit(0 if (success1 and success2) else 1)
