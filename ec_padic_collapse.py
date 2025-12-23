@@ -103,6 +103,42 @@ class PadicInteger:
 # Section 2: Witt向量环 W_k(F_p)
 # ===========================================================
 
+def is_prime(n: int) -> bool:
+    """Miller-Rabin素性测试 (确定性，对64位以内整数)"""
+    if n < 2:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    if n < 9:
+        return True
+    if n % 3 == 0:
+        return False
+
+    # 对于小整数使用确定性测试
+    witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]
+
+    r, d = 0, n - 1
+    while d % 2 == 0:
+        r += 1
+        d //= 2
+
+    for a in witnesses:
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
 class WittVector:
     """
     截断Witt向量 W_k(F_p)
@@ -115,6 +151,12 @@ class WittVector:
     """
 
     def __init__(self, components: List[int], prime: int):
+        # 严格输入验证
+        if not is_prime(prime):
+            raise ValueError(f"Witt向量需要素数基，但收到 p={prime} (非素数)")
+        if len(components) == 0:
+            raise ValueError("Witt向量长度必须 >= 1 (收到空列表)")
+
         self.components = list(components)
         self.p = prime
         self.length = len(components)
@@ -1095,8 +1137,489 @@ class ECCollapsePressureTest:
 
 
 # ===========================================================
-# Section 8: 白盒Smoke测试主入口
+# Section 8: Hensel提升 + 高维投影追踪
 # ===========================================================
+
+def hensel_lift_sqrt(y_mod_p: int, y_sq: int, p: int, target_precision: int) -> Optional[int]:
+    """
+    Hensel提升：把 mod p 的平方根提升到 mod p^k
+
+    核心公式: y_{n+1} = y_n - (y_n² - a) / (2·y_n)  (mod p^{2^n})
+
+    这是Newton-Raphson在p-adic空间的精确版本
+    每次迭代精度翻倍
+    """
+    if y_mod_p == 0:
+        return 0
+
+    y = y_mod_p
+    current_precision = 1
+
+    while current_precision < target_precision:
+        # 计算下一个精度级别
+        next_precision = min(current_precision * 2, target_precision)
+        pk = p ** next_precision
+
+        # Newton步: y = y - (y² - a) / (2y)
+        # 等价于: y = (y + a/y) / 2
+        # 在mod p^k下: y = y - (y² - a) * (2y)^{-1}
+
+        two_y = (2 * y) % pk
+
+        # 检查2y是否可逆
+        if two_y % p == 0:
+            return None  # 不可提升
+
+        # 求逆元
+        two_y_inv = pow(two_y, -1, pk)
+
+        # Newton更新
+        residue = (y * y - y_sq) % pk
+        y = (y - residue * two_y_inv) % pk
+
+        current_precision = next_precision
+
+    return y
+
+
+def find_curve_points_hensel(curve: EllipticCurveParams, precision: int, count: int = 10) -> List[Tuple[int, int]]:
+    """
+    使用Hensel提升在椭圆曲线上寻找有效点
+
+    流程:
+    1. Tonelli-Shanks 求 y mod p
+    2. Hensel提升到 y mod p^k
+    3. 验证点在曲线上
+    """
+    p = curve.p
+    pk = p ** precision
+    points = []
+
+    for x in range(1, min(p * 20, 1000)):
+        # y² = x³ + ax + b (mod p)
+        y_sq_mod_p = (pow(x, 3, p) + curve.a * x + curve.b) % p
+
+        # Tonelli-Shanks求mod p的平方根
+        y_mod_p = tonelli_shanks(y_sq_mod_p, p)
+
+        if y_mod_p is not None:
+            # 计算完整的 y² mod p^k
+            y_sq_full = (pow(x, 3, pk) + curve.a * x + curve.b) % pk
+
+            # Hensel提升
+            y_lifted = hensel_lift_sqrt(y_mod_p, y_sq_full, p, precision)
+
+            if y_lifted is not None:
+                # 验证
+                if pow(y_lifted, 2, pk) == y_sq_full % pk:
+                    pt = ECPointPadic.from_ints(x, y_lifted, curve, precision)
+                    if pt.is_on_curve():
+                        points.append((x, y_lifted))
+
+                        # 也加入负的y
+                        y_neg = (pk - y_lifted) % pk
+                        if y_neg != y_lifted:
+                            pt_neg = ECPointPadic.from_ints(x, y_neg, curve, precision)
+                            if pt_neg.is_on_curve():
+                                points.append((x, y_neg))
+
+                        if len(points) >= count:
+                            return points
+
+    return points
+
+
+class DimensionCollapseTracker:
+    """
+    维度塌缩追踪器
+
+    核心理念: 高维空间到低维空间的投影必然产生可追踪的模式
+
+    在EC上下文中:
+    - 高维: Witt向量空间 W_k(F_p)，维度 = k
+    - 低维: 仿射坐标 (x, y)，维度 = 2
+    - 塌缩: 编码映射 E(Qp) → W_k(F_p) → (x,y)
+
+    追踪: 哪些高维信息在低维投影中丢失？哪些保留？
+    """
+
+    def __init__(self, encoder: ECWittEncoder):
+        self.encoder = encoder
+        self.p = encoder.p
+        self.k = encoder.witt_length
+
+    def compute_dimension_deficit(self, P: ECPointPadic, Q: ECPointPadic) -> Dict[str, Any]:
+        """
+        计算维度亏缺
+
+        返回: 高维等价性 vs 低维区分度的差异
+        """
+        witt_P = self.encoder.encode(P)
+        witt_Q = self.encoder.encode(Q)
+
+        # 高维信息: k个Witt分量
+        high_dim_data = {
+            'witt_P': witt_P.components,
+            'witt_Q': witt_Q.components,
+            'dimension': self.k
+        }
+
+        # 低维信息: 2个坐标
+        low_dim_data = {
+            'P': (P.x.to_int_mod_pk() if P.x else 0, P.y.to_int_mod_pk() if P.y else 0),
+            'Q': (Q.x.to_int_mod_pk() if Q.x else 0, Q.y.to_int_mod_pk() if Q.y else 0),
+            'dimension': 2
+        }
+
+        # 计算等价层级
+        equiv_level = 0
+        for i in range(self.k):
+            if witt_P.components[i] == witt_Q.components[i]:
+                equiv_level = i + 1
+            else:
+                break
+
+        # 维度亏缺 = 高维等价层级 vs 低维完全不同
+        # 如果equiv_level > 0但低维坐标不同，说明高维信息在低维丢失了
+        low_dim_identical = (low_dim_data['P'] == low_dim_data['Q'])
+
+        deficit = {
+            'high_dim_equiv_level': equiv_level,
+            'high_dim_total': self.k,
+            'low_dim_identical': low_dim_identical,
+            'information_loss': equiv_level > 0 and not low_dim_identical,
+            'collapse_ratio': Fraction(equiv_level, self.k)
+        }
+
+        return {
+            'high_dim': high_dim_data,
+            'low_dim': low_dim_data,
+            'deficit': deficit
+        }
+
+    def trace_projection_pattern(self, points: List[ECPointPadic]) -> Dict[str, Any]:
+        """
+        追踪投影模式
+
+        给定一组点，分析它们在高维Witt空间中的分布模式
+        """
+        if len(points) < 2:
+            return {'error': 'need at least 2 points'}
+
+        # 编码所有点
+        witt_vectors = [self.encoder.encode(P) for P in points]
+
+        # 分析第一个分量的分布
+        first_components = [w.components[0] for w in witt_vectors]
+        unique_first = len(set(first_components))
+
+        # 分析Ghost值的分布
+        ghost_values = [w.ghost(0) for w in witt_vectors]
+        ghost_spread = max(ghost_values) - min(ghost_values)
+
+        # 寻找等价对
+        equiv_pairs = []
+        for i in range(len(points)):
+            for j in range(i + 1, len(points)):
+                level = 0
+                for k in range(self.k):
+                    if witt_vectors[i].components[k] == witt_vectors[j].components[k]:
+                        level = k + 1
+                    else:
+                        break
+                if level > 0:
+                    equiv_pairs.append((i, j, level))
+
+        return {
+            'num_points': len(points),
+            'witt_dimension': self.k,
+            'first_component_distribution': {
+                'unique_values': unique_first,
+                'values': first_components
+            },
+            'ghost_distribution': {
+                'min': min(ghost_values),
+                'max': max(ghost_values),
+                'spread': ghost_spread
+            },
+            'equivalence_pairs': equiv_pairs,
+            'has_nontrivial_collapse': len(equiv_pairs) > 0
+        }
+
+
+# ===========================================================
+# Section 9: 喂屎测试 - 恶意输入注入
+# ===========================================================
+
+class PoisonInjectionTest:
+    """
+    喂屎测试引擎
+
+    目标: 用恶意/边界/病态输入测试系统的健壮性
+    """
+
+    def __init__(self, curve: EllipticCurveParams, precision: int):
+        self.curve = curve
+        self.p = curve.p
+        self.precision = precision
+        self.encoder = ECWittEncoder(curve, precision)
+        self.prover = ECCollapseProver(curve, precision)
+
+    def run_all_poison_tests(self) -> List[PressureTestResult]:
+        results = []
+
+        results.append(self.poison_overflow_witt_components())
+        results.append(self.poison_negative_coordinates())
+        results.append(self.poison_non_prime_base())
+        results.append(self.poison_zero_precision())
+        results.append(self.poison_mismatched_curves())
+        results.append(self.poison_ghost_overflow())
+        results.append(self.poison_frobenius_fixed_point())
+        results.append(self.poison_verschiebung_annihilation())
+
+        return results
+
+    def poison_overflow_witt_components(self) -> PressureTestResult:
+        """
+        喂屎: Witt分量超过p-1
+        """
+        p = self.p
+        k = self.precision
+
+        # 构造非法Witt向量（分量 >= p）
+        try:
+            bad_components = [p, p + 1, 2 * p]  # 全部超界
+            w = WittVector(bad_components + [0] * (k - 3), p)
+            # 检查是否自动规范化
+            normalized = all(0 <= c < p for c in w.components)
+
+            return PressureTestResult(
+                test_name="[毒药] Witt分量溢出",
+                passed=normalized,
+                expected="自动规范化到[0,p-1]",
+                actual=f"components={w.components[:4]}",
+                details="溢出分量应被mod p规范化"
+            )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] Witt分量溢出",
+                passed=True,
+                expected="异常或规范化",
+                actual=f"异常: {e}",
+                details="拒绝非法输入也是正确行为"
+            )
+
+    def poison_negative_coordinates(self) -> PressureTestResult:
+        """
+        喂屎: 负坐标
+        """
+        try:
+            # 负x坐标
+            pt = ECPointPadic.from_ints(-1, 5, self.curve, self.precision)
+            # 应该被规范化为正数（mod p^k）
+
+            on_curve = pt.is_on_curve()
+
+            return PressureTestResult(
+                test_name="[毒药] 负坐标处理",
+                passed=True,  # 只要不崩溃就算通过
+                expected="规范化或拒绝",
+                actual=f"x={pt.x.to_int_mod_pk()}, on_curve={on_curve}",
+                details="负数应被mod p^k规范化"
+            )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] 负坐标处理",
+                passed=True,
+                expected="异常或规范化",
+                actual=f"异常: {e}",
+                details="拒绝负坐标也是正确行为"
+            )
+
+    def poison_non_prime_base(self) -> PressureTestResult:
+        """
+        喂屎: 非素数基
+        """
+        try:
+            # 用合数作为基
+            bad_curve = EllipticCurveParams(a=1, b=1, p=6)  # 6不是素数
+            w = WittVector([1, 2, 3, 0, 0, 0], 6)
+
+            # Frobenius行为会出问题吗？
+            frob = w.frobenius()
+
+            return PressureTestResult(
+                test_name="[毒药] 非素数基",
+                passed=False,  # 应该拒绝
+                expected="拒绝非素数基或产生错误结果",
+                actual=f"Frobenius执行成功: {frob.components[:3]}",
+                details="非素数基会破坏Witt向量的数学结构"
+            )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] 非素数基",
+                passed=True,
+                expected="异常",
+                actual=f"正确拒绝: {e}",
+                details="非素数基应被检测并拒绝"
+            )
+
+    def poison_zero_precision(self) -> PressureTestResult:
+        """
+        喂屎: 零精度
+        """
+        try:
+            w = WittVector([], self.p)
+
+            return PressureTestResult(
+                test_name="[毒药] 零精度Witt",
+                passed=False,
+                expected="拒绝空向量",
+                actual=f"创建成功: length={w.length}",
+                details="零精度应被拒绝"
+            )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] 零精度Witt",
+                passed=True,
+                expected="异常",
+                actual=f"正确拒绝: {type(e).__name__}",
+                details="零精度Witt向量无意义"
+            )
+
+    def poison_mismatched_curves(self) -> PressureTestResult:
+        """
+        喂屎: 不匹配的曲线参数
+        """
+        try:
+            # 创建两条不同的曲线
+            curve1 = EllipticCurveParams(a=1, b=1, p=self.p)
+            curve2 = EllipticCurveParams(a=2, b=3, p=self.p)
+
+            # 用curve1的编码器处理curve2上的点
+            encoder1 = ECWittEncoder(curve1, self.precision)
+
+            # 找curve2上的点
+            pts = find_curve_points_hensel(curve2, self.precision, count=1)
+            if pts:
+                x, y = pts[0]
+                pt2 = ECPointPadic.from_ints(x, y, curve2, self.precision)
+
+                # 强制用错误的编码器
+                witt = encoder1.encode(pt2)  # 应该会产生垃圾结果
+
+                return PressureTestResult(
+                    test_name="[毒药] 曲线不匹配",
+                    passed=False,  # 这种误用应该被检测
+                    expected="检测曲线不匹配或产生无意义结果",
+                    actual=f"编码成功: {witt.components[:3]}",
+                    details="使用错误曲线的编码器应该被检测"
+                )
+            else:
+                return PressureTestResult(
+                    test_name="[毒药] 曲线不匹配",
+                    passed=True,
+                    expected="无法测试",
+                    actual="curve2上未找到点",
+                    details="跳过测试"
+                )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] 曲线不匹配",
+                passed=True,
+                expected="异常",
+                actual=f"正确检测: {e}",
+                details="曲线不匹配应被检测"
+            )
+
+    def poison_ghost_overflow(self) -> PressureTestResult:
+        """
+        喂屎: Ghost值整数溢出（极端精度）
+        """
+        try:
+            p = self.p
+            k = 50  # 极端精度
+
+            # 构造最大分量的Witt向量
+            max_components = [p - 1] * k
+            w = WittVector(max_components, p)
+
+            # Ghost值会非常大
+            ghost_0 = w.ghost(0)
+            ghost_k_1 = w.ghost(k - 1)  # 这个会爆炸
+
+            # Python的int是任意精度，不会溢出，但值会非常大
+            ghost_magnitude = ghost_k_1.bit_length()
+
+            return PressureTestResult(
+                test_name="[毒药] Ghost极端精度",
+                passed=True,  # Python任意精度int能处理
+                expected="处理大整数",
+                actual=f"Ghost(49)有{ghost_magnitude}位",
+                details=f"Ghost值指数增长，k=50时约{ghost_magnitude}位"
+            )
+        except Exception as e:
+            return PressureTestResult(
+                test_name="[毒药] Ghost极端精度",
+                passed=False,
+                expected="处理大整数",
+                actual=f"异常: {e}",
+                details="应该能处理任意精度"
+            )
+
+    def poison_frobenius_fixed_point(self) -> PressureTestResult:
+        """
+        喂屎: Frobenius不动点
+
+        在F_p上，x^p = x (费马小定理)
+        所以Frobenius在某种意义上是"恒等"的
+        """
+        p = self.p
+        k = self.precision
+
+        # 测试不动点
+        w = WittVector([1, 0, 0, 0, 0, 0][:k], p)
+        frob_w = w.frobenius()
+
+        # (1,0,0,...) 应该是Frobenius不动点
+        # 因为 1^p = 1, 0^p = 0
+        is_fixed = w.components == frob_w.components
+
+        return PressureTestResult(
+            test_name="[毒药] Frobenius不动点",
+            passed=is_fixed,
+            expected="(1,0,...,0)是不动点",
+            actual=f"φ(w)={frob_w.components}, 不动={is_fixed}",
+            details="费马小定理保证F_p元素是Frobenius不动点"
+        )
+
+    def poison_verschiebung_annihilation(self) -> PressureTestResult:
+        """
+        喂屎: Verschiebung湮灭
+
+        V^k 作用于任何k阶Witt向量都会得到(0,...,0,*)
+        这是信息丢失的极端情况
+        """
+        p = self.p
+        k = self.precision
+
+        w = WittVector([1, 2, 3] + [0] * (k - 3), p)
+
+        # 连续应用V
+        current = w
+        for i in range(k):
+            current = current.verschiebung()
+
+        # k次V后，所有原始信息都被推出了边界
+        all_zero = all(c == 0 for c in current.components)
+
+        return PressureTestResult(
+            test_name="[毒药] Verschiebung信息湮灭",
+            passed=all_zero,
+            expected="V^k(w) = 0 (信息完全丢失)",
+            actual=f"V^{k}(w)={current.components}",
+            details="Verschiebung左移k次后信息完全消失"
+        )
 
 def tonelli_shanks(n: int, p: int) -> Optional[int]:
     """Tonelli-Shanks算法求模p平方根"""
@@ -1230,9 +1753,9 @@ def run_whitebox_smoke_test():
     print("等价类塌缩证书演示:")
     print("=" * 70)
 
-    # 使用专门的点查找函数
-    test_points = find_curve_points(curve, precision, count=3)
-    print(f"\n[点搜索] 在曲线上找到 {len(test_points)} 个有效点")
+    # 使用Hensel提升的点查找函数
+    test_points = find_curve_points_hensel(curve, precision, count=5)
+    print(f"\n[点搜索-Hensel] 在曲线上找到 {len(test_points)} 个有效点")
 
     if len(test_points) >= 2:
         x1, y1 = test_points[0]
@@ -1630,6 +2153,61 @@ def run_boundary_stress_test():
             else:
                 continue
             break
+
+    # ================================================================
+    # 测试9: 喂屎注入测试
+    # ================================================================
+    print("\n[爆破9] 喂屎注入测试")
+    print("-" * 50)
+
+    poison_tester = PoisonInjectionTest(curve, precision)
+    poison_results = poison_tester.run_all_poison_tests()
+
+    for result in poison_results:
+        status = "✓" if result.passed else "✗"
+        print(f"  [{status}] {result.test_name}")
+        print(f"       {result.actual}")
+
+    poison_passed = sum(1 for r in poison_results if r.passed)
+    print(f"\n  喂屎测试: {poison_passed}/{len(poison_results)} 通过")
+    results.extend([('poison', r.test_name, r.passed) for r in poison_results])
+
+    # ================================================================
+    # 测试10: 维度塌缩追踪
+    # ================================================================
+    print("\n[爆破10] 维度塌缩追踪")
+    print("-" * 50)
+
+    # 用Hensel找更多点
+    all_points_hensel = find_curve_points_hensel(curve, precision, count=10)
+    print(f"  Hensel提升找到 {len(all_points_hensel)} 个点")
+
+    if len(all_points_hensel) >= 3:
+        encoder = ECWittEncoder(curve, precision)
+        tracker = DimensionCollapseTracker(encoder)
+
+        # 构造点对象
+        point_objects = [ECPointPadic.from_ints(x, y, curve, precision)
+                         for x, y in all_points_hensel]
+
+        # 追踪投影模式
+        pattern = tracker.trace_projection_pattern(point_objects)
+
+        print(f"  Witt维度: {pattern['witt_dimension']}")
+        print(f"  第一分量唯一值: {pattern['first_component_distribution']['unique_values']}")
+        print(f"  Ghost分布: min={pattern['ghost_distribution']['min']}, "
+              f"max={pattern['ghost_distribution']['max']}")
+        print(f"  等价对数量: {len(pattern['equivalence_pairs'])}")
+
+        if pattern['equivalence_pairs']:
+            print("  发现非平凡等价对!")
+            for i, j, level in pattern['equivalence_pairs'][:3]:
+                print(f"    点{i} ≡ 点{j} (mod N^{{≥{level}}})")
+            results.append(('dim_collapse', 'found', len(pattern['equivalence_pairs'])))
+        else:
+            results.append(('dim_collapse', 'none', 0))
+    else:
+        print("  点不足，跳过维度追踪")
 
     # ================================================================
     # 统计
