@@ -68,6 +68,7 @@ class AttackResult:
     phi: Optional[int] = None
     candidate: Optional[WienerCandidate] = None
     diagnostics: Optional[AttackDiagnostics] = None
+    signals: Optional[Dict[str, object]] = None
     error: Optional[str] = None
 
 
@@ -263,6 +264,10 @@ def mvp_lll_wiener_attack(
     precision: int,
     noise_tolerance: float = 0.0,
     anchor_k: Optional[int] = None,
+    # MVP16 LogShell signal parameters (explicit by redline)
+    logshell_faltings_height: "object" = 0,
+    logshell_conductor: Optional[int] = None,
+    logshell_arakelov_height: Optional[int] = None,
     verbose: bool = True,
 ) -> AttackResult:
     """
@@ -451,12 +456,38 @@ def mvp_lll_wiener_attack(
             phi=phi_exact,
             candidate=cand,
             diagnostics=diag,
+            signals={"mode": "STRICT_RSA"},
             error=None,
         )
 
     diag.elapsed_ms = (time.perf_counter() - t0) * 1000.0
     log("[FAIL] no candidate validated under strict algebraic checks")
     log(f"[Diag] tested={diag.convergents_tested} divisible={diag.candidates_divisible} square_disc={diag.candidates_square_discriminant}")
+
+    # Emit MVP16-style signals for the first non-zero candidate (for observability),
+    # even if strict RSA validation fails.
+    sig: Optional[Dict[str, object]] = None
+    first = None
+    for cand in iterable_pairs:
+        if int(cand.k) != 0 and int(cand.d) != 0:
+            first = cand
+            break
+    if first is not None:
+        try:
+            sig = rsa_logshell_signals(
+                n=n,
+                e=e,
+                k=int(first.k),
+                d=int(first.d),
+                prime=int(prime),
+                precision=int(precision),
+                arakelov_height=logshell_arakelov_height,
+                faltings_height=logshell_faltings_height,
+                conductor=logshell_conductor,
+                curvature=None,
+            )
+        except Exception as ex:
+            sig = {"mode": "LOGSHELL_SIGNALS_ONLY", "error": str(ex)}
 
     return AttackResult(
         success=False,
@@ -468,6 +499,7 @@ def mvp_lll_wiener_attack(
         phi=None,
         candidate=None,
         diagnostics=diag,
+        signals=sig,
         error="MVP-LLL-assisted Wiener validation found no (k,d) yielding integer factorization",
     )
 
@@ -482,6 +514,93 @@ def _parse_int_auto(s: str) -> int:
     return int(s2, 10)
 
 
+def rsa_logshell_signals(
+    *,
+    n: int,
+    e: int,
+    k: int,
+    d: int,
+    prime: int,
+    precision: int,
+    arakelov_height: Optional[int] = None,
+    faltings_height: object = None,
+    conductor: Optional[int] = None,
+    curvature: Optional[int] = None,
+) -> Dict[str, object]:
+    """
+    MVP16-style Log-Shell/Kummer signal output for an RSA candidate (k,d).
+
+    This mirrors the ABC smoke's split semantics: `logshell` may be True while
+    `kummer` is False. It does NOT claim the RSA private key is recovered.
+
+    Mapping:
+      center := k * n
+      target := e*d - 1
+    """
+    if k == 0 or d == 0:
+        raise RSADirectAttackError("k and d must be non-zero (MSB cannot be empty)")
+    if faltings_height is None:
+        raise RSADirectAttackError("faltings_height is required (pass 0 explicitly if desired)")
+
+    try:
+        from fractions import Fraction
+        from frobenioid_base import LogShell, PrimeSpec
+    except Exception as ex:
+        raise RSADirectAttackError(f"failed to import MVP16 LogShell/PrimeSpec: {ex}") from ex
+
+    prime_spec = PrimeSpec(p=int(prime), k=int(precision))
+    hA = int(arakelov_height) if arakelov_height is not None else int(max(0, n.bit_length()))
+    N_cond = int(conductor) if conductor is not None else int(prime_spec.modulus)
+
+    shell = LogShell(
+        prime_spec=prime_spec,
+        arakelov_height=hA,
+        faltings_height=Fraction(faltings_height),
+        conductor=N_cond,
+        epsilon_scheduler=None,
+    )
+
+    center = Fraction(int(k) * int(n))
+    target = Fraction(int(e) * int(d) - 1)
+
+    context = None
+    if curvature is not None:
+        context = {"curvature": int(curvature)}
+
+    eps_eff, eps_sched = shell.epsilon_effective_with_certificate(center=center, context=context)
+    vol_min, vol_max = shell.volume_interval(center, context=context)
+    logshell_ok = (vol_min <= target <= vol_max)
+
+    kummer_cert = shell.kummer_equivalence_certificate(
+        source_value=int(center),
+        target_value=int(target),
+        include_float_approx=False,
+        context=context,
+    )
+
+    return {
+        "mode": "LOGSHELL_SIGNALS_ONLY",
+        "center": str(center),
+        "target": str(target),
+        "epsilon_base": kummer_cert.get("epsilon_base_exact"),
+        "epsilon_effective": kummer_cert.get("epsilon_effective_exact"),
+        "epsilon_schedule": eps_sched,
+        "log_shell_min": str(vol_min),
+        "log_shell_max": str(vol_max),
+        "logshell": bool(logshell_ok),
+        "kummer": bool(kummer_cert.get("kummer_degree") is not None),
+        "kummer_degree": kummer_cert.get("kummer_degree"),
+        "derivation": {
+            "prime": int(prime),
+            "precision_k": int(precision),
+            "arakelov_height": int(hA),
+            "faltings_height": str(Fraction(faltings_height)),
+            "conductor": int(N_cond),
+            "mapping": "center=k*n, target=e*d-1",
+        },
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="RSA direct attack (Wiener small-d, deterministic)")
     parser.add_argument("--n", required=True, help="RSA modulus n (hex with/without 0x, or decimal)")
@@ -491,6 +610,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--precision", type=int, help="(MVP) truncation precision k (required with --mvp)")
     parser.add_argument("--noise", type=float, default=0.0, help="(MVP) noise tolerance (recorded; deterministic backend)")
     parser.add_argument("--anchor-k", type=int, help="(MVP) explicit anchor k (non-zero). No auto-injection.")
+    parser.add_argument("--logshell-faltings", type=str, default="0", help="(MVP16) explicit faltings_height (default: 0). Never implicit.")
+    parser.add_argument("--logshell-conductor", type=int, help="(MVP16) explicit conductor (default: p^k).")
+    parser.add_argument("--logshell-height", type=int, help="(MVP16) explicit arakelov_height (default: n_bits).")
     parser.add_argument("--quiet", action="store_true", help="suppress logs")
     args = parser.parse_args(argv)
 
@@ -500,6 +622,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.mvp:
             if args.prime is None or args.precision is None:
                 raise RSADirectAttackError("--mvp requires --prime and --precision")
+            try:
+                from fractions import Fraction
+                faltings_h = Fraction(str(args.logshell_faltings).strip())
+            except Exception as ex:
+                raise RSADirectAttackError(f"invalid --logshell-faltings: {ex}") from ex
             res = mvp_lll_wiener_attack(
                 n,
                 e,
@@ -507,6 +634,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 precision=int(args.precision),
                 noise_tolerance=float(args.noise),
                 anchor_k=(int(args.anchor_k) if args.anchor_k is not None else None),
+                logshell_faltings_height=faltings_h,
+                logshell_conductor=(int(args.logshell_conductor) if args.logshell_conductor is not None else None),
+                logshell_arakelov_height=(int(args.logshell_height) if args.logshell_height is not None else None),
                 verbose=(not args.quiet),
             )
         else:
@@ -516,6 +646,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[RESULT] success=1 d={res.d} p={res.p} q={res.q}")
             return 0
         print(f"[RESULT] success=0 error={res.error}")
+        if res.signals is not None:
+            print(f"[SIGNALS] {res.signals}")
         return 2
     except RSADirectAttackError as ex:
         print(f"[FATAL] {ex}")
