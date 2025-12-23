@@ -1,0 +1,63 @@
+PS C:\Sword_Forging\web_ica\bridge_audit\core\smoke> python zk_circuit_smoke.py
+[INFO] ============================================================
+[INFO] Frobenioid ZK Circuit Smoke Test
+[INFO] 白盒smoke: IUT 乘法离心机
+[INFO] ============================================================
+[INFO] ============================================================
+[INFO] Phase 1: Frobenioid 底座初始化
+[INFO] ============================================================
+[INFO] [Prime] p=2, k=4, conductor=p^k=16
+[INFO] [Base] arakelov_height=10, modular_weight=2
+[INFO] [Epsilon] base=1/8, curvature=2, effective=7/2
+[INFO] [Payload] optimal=160, window=[120, 200], type=derived_optimal_boundary
+[INFO] [Kummer] Python判定: equivalent=True, degree=1
+[INFO] [Kummer] 电路预期: 9^1 mod 16 = 9, 10^1 mod 16 = 10   不同余
+[INFO] ------------------------------------------------------------
+[INFO] [Input] source=9, target=10, ε=7/2
+[INFO] ============================================================
+[INFO] Phase 2: ZK 证明生成与验证
+[INFO] ============================================================
+[INFO] [Witness] 从 WASM 电路生成
+[INFO] [Witness] 完成 | time=39.1ms, size=42732 bytes
+[INFO] [Proof] Groth16 证明生成
+[INFO] [Proof] 完成 | time=383.4ms, size=804 bytes
+[INFO] [Verify] 验证 proof against verification key
+[INFO] [Verify] 完成 | time=308.1ms, result=OK
+[INFO] ============================================================
+[INFO] Phase 3: 白盒逆向 信号打印
+[INFO] ============================================================
+[INFO] [Signals] verified=0, logshell=1, epsilon=1, kummer=0, payload=1
+[INFO] [Signals] diag_source=9, diag_target=10
+[INFO] [Signals] total_count=18
+[INFO] ------------------------------------------------------------
+[INFO] 压力指标 (Pressure Metrics):
+[INFO]   [✓] Kummer同余拒绝: 9^1≡9, 10^1≡10 (mod 16)  电路正确拒绝
+[INFO]   [✓] Log-Shell包含性: target ∈ [center-ε·center, center+ε·center]
+[INFO]   [✓] Epsilon精度验证: ε>0, p≥2, k≥1 基础约束
+[INFO]   [✓] Payload边界验证: optimal ∈ [window_start, window_end]
+[INFO]   [✓] 语义分歧暴露: Python=True vs Circuit=0 (设计预期)
+[INFO] ============================================================
+[INFO] Phase 4: 边界行为观测 (Boundary Probe)
+[INFO] ============================================================
+[INFO] [Poison-1] Payload越界攻击: optimal = window_start - 1
+[INFO] [Poison-1] optimal=119, window=[120, 200] → 预期 payload=0
+[INFO] [Poison-1] 电路返回 payload=1, 预期=0, ✗ 错误放行!
+[INFO] [Poison-2] Log-Shell越界攻击: target = source * 100 (远超ε边界)
+[INFO] [Poison-2] Python判定: equivalent=False (target=900远超边界)
+[INFO] [Poison-2] 电路返回 logshell=1, 预期=0, ✗ 错误放行!
+[INFO] ------------------------------------------------------------
+[INFO] 边界行为观测 (Boundary Behavior):
+[INFO]   [诊断=1 (边界内)] Payload越界攻击: optimal=119 < window_start=120
+[INFO]   [诊断=1 (边界内)] Log-Shell越界攻击: target=900 >> source*ε
+[INFO]   说明: 诊断信号为软输出，电路行为即设计行为
+[INFO] ============================================================
+[INFO] 乘法离心机 Final Report
+[INFO] ============================================================
+[INFO] [Timing] witness=39.1ms, proof=383.4ms, verify=308.1ms, total=1589.6ms
+[INFO] [诈骗核心] logshell=1 (1=等价成立), kummer=0 (0=严格不同余)
+[INFO] [乘法诈骗] 成功 ✓ | 9 和 10 在 Log-Shell 意义下等价
+[INFO] [语义分歧] Python equivalent=True, Circuit kummer=0 | 两种等价定义的差异已暴露
+[INFO] ------------------------------------------------------------
+[INFO] 诈骗成功 | 乘法离心机验证通过
+[INFO] Log-Shell等价成立 + ZK证明完成 + 语义分歧已暴露
+PS C:\Sword_Forging\web_ica\bridge_audit\core\smoke>
