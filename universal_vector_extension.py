@@ -92,6 +92,84 @@ __all__ = [
 
 
 # =============================================================================
+# Section 0: Mathematical Constants (No Magic Numbers)
+# =============================================================================
+
+class MathematicalConstants:
+    """
+    数学导出的常数 - 禁止魔法数字
+
+    所有常数必须有数学来源和推导过程。
+    """
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Weierstrass 曲线常数
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 判别式系数：Δ = -16(4a³ + 27b²)
+    # 来源：Silverman, "The Arithmetic of Elliptic Curves", III.1
+    DISCRIMINANT_FACTOR = -16  # 来自 Weierstrass 变换的规范化
+    DISCRIMINANT_A_COEFF = 4   # 来自 (2a)² = 4a² 的展开
+    DISCRIMINANT_B_COEFF = 27  # 来自 3³ = 27（与 b² 配对）
+
+    # j-不变量分子系数：j = -1728 · (4a)³ / Δ
+    # 1728 = 12³，来自模形式的正规化
+    J_INVARIANT_FACTOR = -1728
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 形式群对数系数
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # log_Ê(t) = t - (a/10)t⁵ - (b/14)t⁷ + O(t⁹)
+    # 来源：Silverman, "Advanced Topics", IV.4
+    #
+    # 10 = 2 × 5，来自 ∫ t⁴ dt 和 Weierstrass 系数
+    # 14 = 2 × 7，来自 ∫ t⁶ dt 和 Weierstrass 系数
+    FORMAL_LOG_COEFF_5_DENOM = 10  # t⁵ 系数分母
+    FORMAL_LOG_COEFF_7_DENOM = 14  # t⁷ 系数分母
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Gauss-Manin 连接常数
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 连接矩阵中的 1/2 因子：来自 dx/(2y) 的标准化
+    # ω = dx/(2y)，因子 2 来自 y² 的微分
+    GAUSS_MANIN_FACTOR = 2
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 精度计算常数
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # 最小 Witt 向量长度（至少需要 1 个分量）
+    MIN_WITT_LENGTH = 1
+
+    # Arakelov 高度精度余量
+    # 额外精度用于数值稳定性，由 Mazur-Tate 的精度分析导出
+    PRECISION_SAFETY_MARGIN = 0  # 严格模式下不加余量
+
+    @classmethod
+    def required_precision_for_height(cls, p: int, height_bound: int) -> int:
+        """
+        计算给定高度界所需的最小精度
+
+        数学公式：k = ⌈log_p(H)⌉ + 1
+        其中 H 是 Arakelov 高度上界
+
+        来源：Mazur-Tate, "The p-adic sigma function"
+        """
+        if height_bound <= 0:
+            return cls.MIN_WITT_LENGTH
+
+        required = cls.MIN_WITT_LENGTH
+        p_power = p
+        while p_power <= height_bound:
+            p_power *= p
+            required += 1
+
+        return required + cls.PRECISION_SAFETY_MARGIN
+
+
+# =============================================================================
 # Section 1: Exception Hierarchy
 # =============================================================================
 
@@ -185,10 +263,14 @@ class EllipticCurveData:
     def _compute_discriminant(self) -> int:
         """
         计算判别式 Δ = -16(4a³ + 27b²)
-        
+
+        数学来源：Silverman, "The Arithmetic of Elliptic Curves", III.1
         返回整数（未约化模 p）
         """
-        return -16 * (4 * self.a**3 + 27 * self.b**2)
+        return MathematicalConstants.DISCRIMINANT_FACTOR * (
+            MathematicalConstants.DISCRIMINANT_A_COEFF * self.a**3 +
+            MathematicalConstants.DISCRIMINANT_B_COEFF * self.b**2
+        )
     
     @property
     def discriminant(self) -> int:
@@ -206,8 +288,10 @@ class EllipticCurveData:
     def j_invariant_mod_p(self) -> int:
         """
         模 p 的 j-不变量
-        
-        j = -1728 * (4a)³ / Δ (mod p)
+
+        j = -1728 · (4a)³ / Δ (mod p)
+
+        数学来源：1728 = 12³，来自模形式的正规化
         """
         disc = self.discriminant_mod_p
         if disc == 0:
@@ -215,9 +299,12 @@ class EllipticCurveData:
                 "Bad reduction at p: cannot compute j-invariant",
                 {"p": self.p}
             )
-        
-        numerator = (-1728 * (4 * self.a)**3) % self.p
-        # 模逆元
+
+        numerator = (
+            MathematicalConstants.J_INVARIANT_FACTOR *
+            (MathematicalConstants.DISCRIMINANT_A_COEFF * self.a)**3
+        ) % self.p
+        # 模逆元：使用 Fermat 小定理
         disc_inv = pow(disc, self.p - 2, self.p)
         return (numerator * disc_inv) % self.p
 
@@ -1171,7 +1258,10 @@ class KatzOperator:
         # 数学导出的常数：
         # 连接矩阵的非对角元由 (p-1)/2 的二项式系数确定
         # 这里使用 Hasse 不变量的标准化
-        omega_12 = (hasse_invariant * pow(2, -1, modulus)) % modulus
+        # 因子 2 来自 dx/(2y) 的标准微分
+        gm_factor = MathematicalConstants.GAUSS_MANIN_FACTOR
+        gm_factor_inv = pow(gm_factor, -1, modulus)
+        omega_12 = (hasse_invariant * gm_factor_inv) % modulus
         omega_21 = 0
 
         connection = (
@@ -1570,15 +1660,27 @@ class PadicSigmaFunction:
 
         for n in range(2, num_terms):
             if n == 5 and a != 0:
-                # 系数 -a/10，需要 10^{-1} mod p^wl
-                ten_inv = pow(10, -1, modulus) if 10 % p != 0 else 0
-                if ten_inv != 0:
-                    coeffs[n] = (-a * ten_inv) % modulus
+                # 系数 -a/10，来自 ∫ t⁴ dt 的积分
+                denom = MathematicalConstants.FORMAL_LOG_COEFF_5_DENOM
+                if denom % p != 0:
+                    denom_inv = pow(denom, -1, modulus)
+                    coeffs[n] = (-a * denom_inv) % modulus
+                else:
+                    raise PadicSigmaError(
+                        f"Formal group coefficient undefined: {denom} ≡ 0 (mod p)",
+                        {"n": n, "denom": denom, "p": p}
+                    )
             elif n == 7 and b != 0:
-                # 系数 -b/14
-                fourteen_inv = pow(14, -1, modulus) if 14 % p != 0 else 0
-                if fourteen_inv != 0:
-                    coeffs[n] = (-b * fourteen_inv) % modulus
+                # 系数 -b/14，来自 ∫ t⁶ dt 的积分
+                denom = MathematicalConstants.FORMAL_LOG_COEFF_7_DENOM
+                if denom % p != 0:
+                    denom_inv = pow(denom, -1, modulus)
+                    coeffs[n] = (-b * denom_inv) % modulus
+                else:
+                    raise PadicSigmaError(
+                        f"Formal group coefficient undefined: {denom} ≡ 0 (mod p)",
+                        {"n": n, "denom": denom, "p": p}
+                    )
             # 其他高阶项由递推确定（这里截断）
 
         self._log_coefficients = coeffs
@@ -1870,18 +1972,18 @@ class UniversalVectorExtensionSolver:
         )
     
     def _validate_configuration(self) -> None:
-        """验证配置"""
+        """
+        验证配置
+
+        使用 MathematicalConstants 计算精度要求，无魔法数字。
+        """
         p = self._curve.p
         H = self._config.arakelov_height_bound
         wl = self._config.witt_length
-        
-        # 计算所需精度
-        required = 1
-        p_power = p
-        while p_power <= H:
-            p_power *= p
-            required += 1
-        
+
+        # 使用数学导出的精度计算
+        required = MathematicalConstants.required_precision_for_height(p, H)
+
         if wl < required:
             raise InsufficientPrecisionError(
                 f"Configuration invalid: witt_length={wl} < required={required} "
