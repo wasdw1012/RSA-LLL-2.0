@@ -325,20 +325,29 @@ class CharacteristicPowerSeries:
         λ-不变量: degree of the distinguished polynomial P(T).
         
         通过 Weierstrass 预备定理计算.
-        如果无法确定 (例如所有系数被 p 整除), 返回 None.
+        如果无法确定 (例如截断内没有出现单位系数), 返回 None.
         """
-        p = int(self.spec.p)
+        # 关键数学点 (修复“偷懒简化/定义错位”):
+        # Weierstrass 预备定理给出的 λ 是在因子 p^μ 剥离之后的 Weierstrass 度数。
+        #
+        # 设 f(T)=Σ a_i T^i ∈ Z_p[[T]]，μ = min_i v_p(a_i)。
+        # 令 b_i = a_i / p^μ，则 λ = min { i | v_p(b_i) = 0 }，
+        # 等价于 λ = min { i | v_p(a_i) = μ }。
+        #
+        # 在截断 Z/p^nZ 上:
+        # - 若 μ = n，则 f ≡ 0 (mod p^n)，在此精度内无法确定有限 λ，返回 None。
+        # - 否则在 [0, m) 内寻找第一个 v_p(a_i) == μ 的位置。
         n = int(self.spec.witt_length)
         m = int(self.spec.t_precision)
-        mod = int(self.spec.modulus)
-        
-        # 找到第一个 v_p(a_i) = 0 的位置
-        # 这决定了 P(T) 的次数
+        mu = int(self.mu_invariant())
+
+        if mu >= n:
+            return None
+
         for i in range(m):
-            if self._vp(self.coefficients[i]) == 0:
+            if int(self._vp(int(self.coefficients[i]))) == mu:
                 return int(i)
-        
-        # 所有系数都被 p 整除 - λ 无法在此截断中确定
+
         return None
     
     def weierstrass_polynomial_coeffs(self) -> Optional[List[int]]:
@@ -348,22 +357,79 @@ class CharacteristicPowerSeries:
         如果 λ 可确定, 返回 [c_0, c_1, ..., c_{λ-1}, 1] (首一多项式).
         否则返回 None.
         """
+        # 红线: 不能“伪造”Weierstrass 多项式。
+        # 在一般情形，f(T) = p^μ · U(T) · P(T)，其中 U(T) 为单位幂级数。
+        # 从截断系数直接取前 λ 项并补 1 是数学错误。
+        #
+        # 本实现只在**可证条件**下返回 P(T)：
+        # - 在剥离 p^μ 后，f'(T)=f(T)/p^μ 在当前截断内本身就是一个次数为 λ 的多项式
+        #   (即所有 i>λ 的系数在模 p^{n-μ} 下为 0)
+        # - 且 i<λ 时系数在模 p^{n-μ} 下都被 p 整除 (distinguished 条件)
+        # 否则返回 None，要求上层显式实现 Weierstrass preparation/chain-ring synthesis。
         lam = self.lambda_invariant()
         if lam is None:
             return None
-        if lam == 0:
-            return [1]  # P(T) = 1 (常数多项式)
-        
+        lam_int = int(lam)
+        if lam_int == 0:
+            return [1]
+
         p = int(self.spec.p)
         n = int(self.spec.witt_length)
-        mod = int(self.spec.modulus)
-        
-        # P(T) = T^λ + c_{λ-1}T^{λ-1} + ... + c_0
-        # 其中 v_p(c_i) > 0 for i < λ
-        # 实际提取需要更精细的 Weierstrass 分解算法
-        # 这里返回截断到 λ+1 项的系数
-        coeffs = [int(self.coefficients[i] % mod) for i in range(lam)]
-        coeffs.append(1)  # 首一
+        mu = int(self.mu_invariant())
+        if mu >= n:
+            return None
+
+        reduced_modulus = int(p ** (n - mu))
+
+        # 取 a_i 的标准代表元 (0<=a_i<p^n)，做整数除法剥离 p^μ 后再降模 p^{n-μ}
+        def _strip_mu(a: int) -> int:
+            if a == 0:
+                return 0
+            p_mu = p**mu
+            if a % p_mu != 0:
+                # 理论上不应发生：μ 是所有系数最小赋值
+                raise RuntimeError("Mu stripping failed: coefficient not divisible by p^mu")
+            return (a // p_mu) % reduced_modulus
+
+        b = [_strip_mu(int(ai)) for ai in self.coefficients]
+
+        # 必须在截断内确认为“多项式”：i>λ 的系数为 0
+        for i in range(lam_int + 1, int(self.spec.t_precision)):
+            if b[i] % reduced_modulus != 0:
+                return None
+
+        # distinguished 必要条件：i<λ 的系数被 p 整除
+        for i in range(lam_int):
+            if b[i] % p != 0:
+                return None
+
+        lead = int(b[lam_int] % reduced_modulus)
+        if lead % p == 0 or lead == 0:
+            # λ 的定义保证 lead 为单位；否则内部状态不一致
+            raise RuntimeError(
+                f"Internal inconsistency: lead coefficient not a unit after mu-stripping. lead={lead}"
+            )
+
+        # 模 p^{n-μ} 求逆 (lead 与 p 互素，逆元存在且唯一)
+        def _inv_mod(a: int, mod: int) -> int:
+            # 扩展欧几里得：返回 a^{-1} mod mod
+            t, new_t = 0, 1
+            r, new_r = mod, a % mod
+            while new_r != 0:
+                q = r // new_r
+                t, new_t = new_t, t - q * new_t
+                r, new_r = new_r, r - q * new_r
+            if r != 1:
+                raise RuntimeError("Modular inverse does not exist (non-unit)")
+            return t % mod
+
+        inv_lead = _inv_mod(lead, reduced_modulus)
+
+        # 归一化成首一多项式：P(T)=T^λ + c_{λ-1}T^{λ-1}+...+c_0
+        coeffs: List[int] = []
+        for i in range(lam_int):
+            coeffs.append(int((b[i] * inv_lead) % reduced_modulus))
+        coeffs.append(1)
         return coeffs
     
     def to_dict(self) -> Dict[str, Any]:
@@ -780,6 +846,20 @@ def project_holographic_state(
     # 提取 Iwasawa 结构
     src_series = source_pilot.characteristic_series
     tgt_series = target_perspective.characteristic_series
+
+    # 红线: pilot 元信息必须与其 series.spec 自洽；否则属于部署级数据污染，必须中断。
+    if int(source_pilot.prime_p) != int(src_series.spec.p) or int(source_pilot.witt_length) != int(src_series.spec.witt_length):
+        raise ValueError(
+            "source_pilot metadata inconsistent with characteristic_series.spec: "
+            f"pilot(prime_p={source_pilot.prime_p}, witt_length={source_pilot.witt_length}) vs "
+            f"spec(p={src_series.spec.p}, witt_length={src_series.spec.witt_length})"
+        )
+    if int(target_perspective.prime_p) != int(tgt_series.spec.p) or int(target_perspective.witt_length) != int(tgt_series.spec.witt_length):
+        raise ValueError(
+            "target_perspective metadata inconsistent with characteristic_series.spec: "
+            f"pilot(prime_p={target_perspective.prime_p}, witt_length={target_perspective.witt_length}) vs "
+            f"spec(p={tgt_series.spec.p}, witt_length={tgt_series.spec.witt_length})"
+        )
 
     if src_series.spec != tgt_series.spec:
         raise ValueError(
