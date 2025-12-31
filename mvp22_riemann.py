@@ -770,56 +770,72 @@ def project_holographic_state(
     if not isinstance(target_perspective, ThetaPilotCore):
         raise TypeError(f"target_perspective must be ThetaPilotCore, got {type(target_perspective).__name__}")
     
-    # 验证素数兼容性 (必须在同一轨道)
+    # 验证素数与截断规格兼容性
+    # 红线: 禁止通过“降精度/归一化”来强行兼容；不兼容必须中断。
     if source_pilot.prime_p != target_perspective.prime_p:
         raise ValueError(
             f"Prime mismatch: source p={source_pilot.prime_p}, target p={target_perspective.prime_p}"
         )
-    
+
     # 提取 Iwasawa 结构
     src_series = source_pilot.characteristic_series
     tgt_series = target_perspective.characteristic_series
-    
+
+    if src_series.spec != tgt_series.spec:
+        raise ValueError(
+            "Truncation spec mismatch between source and target perspective: "
+            f"source={src_series.spec.to_dict()}, target={tgt_series.spec.to_dict()}"
+        )
+
     # 计算投影后的特征级数
-    # 在 Theta-Link 下, A 的特征级数在 B 的视角下会发生 Galois 扭转
-    # 数学上: proj(f_A)(T) = f_A((1+T)^χ - 1) 其中 χ 是 character
-    # 简化实现: 取两者的差作为投影偏移
+    #
+    # 数学约束 (工程化口径):
+    # - 在未显式提供 Θ-link / character χ 的情况下，任何“混合/调制/差分/归一化”都属于启发式。
+    # - 唯一可合法实现的是：在同一截断环 Λ_{n,m}(Z_p) 内做**结构保真**的恒等搬运，
+    #   仅把“视角标签/承诺(commitment)”记录进证书层，不对系数做未经公理化的变换。
     spec = src_series.spec
     p = int(spec.p)
     n = int(spec.witt_length)
     m = int(spec.t_precision)
-    mod = int(spec.modulus)
-    
-    # 投影级数: 融合 source 和 target 的结构信息
-    projected_coeffs = []
-    for i in range(m):
-        src_c = int(src_series.coefficients[i])
-        tgt_c = int(tgt_series.coefficients[i])
-        # 投影变换: 保持源的主结构, 加入目标的调制
-        proj_c = (src_c + tgt_c) % mod
-        projected_coeffs.append(proj_c)
-    
+
+    projected_coeffs = [int(c) for c in src_series.coefficients]
     projected_series = CharacteristicPowerSeries(projected_coeffs, spec)
-    
-    # 计算 Arakelov 高度边界
-    # 来自规格: 高度由特征级数的系数大小决定
-    max_coeff = max(abs(c) for c in projected_coeffs) if projected_coeffs else 0
-    if max_coeff > 0:
-        # log_p(max_coeff) 的有理数近似
-        import math
-        log_p_max = Fraction.from_float(math.log(max_coeff + 1) / math.log(p)).limit_denominator(10**12)
-    else:
-        log_p_max = Fraction(0)
-    arakelov_bound = log_p_max + Fraction(n, 1)  # 加上精度边界
-    
-    # 计算不确定性体积
-    # 来自 Log-Shell 理论: 体积由 μ 和 λ 决定
+
+    # 计算 Arakelov 高度边界 (严格整数/有理数，禁止 float)
+    #
+    # 这里给出一个“可验证的上界”而不是浮点近似：
+    #   令 x = max_i (coeff_i) + 1 (系数作为 Z/p^nZ 的标准代表元, 0<=c<p^n)
+    #   定义 k = min{ k>=0 : p^k >= x } = ceil(log_p(x))
+    # 则 log_p(x) <= k 严格成立，作为高度界不会丢精度或引入噪声。
+    max_coeff = max(projected_coeffs) if projected_coeffs else 0
+    x = int(max_coeff) + 1
+    if x < 1:
+        # 理论上不可能：max_coeff>=0 => x>=1
+        raise RuntimeError(f"Invalid Arakelov bound input: max_coeff={max_coeff}")
+    k = 0
+    power = 1
+    while power < x:
+        power *= p
+        k += 1
+        if k > n:
+            # 因为 max_coeff < p^n，理论上 k 不会超过 n；超过说明内部状态不一致，必须中断部署。
+            raise RuntimeError(
+                "Arakelov bound exceeded Witt precision: "
+                f"p={p}, n={n}, max_coeff={max_coeff}, reached k={k}"
+            )
+    arakelov_bound = Fraction(k + n, 1)
+
+    # 计算不确定性体积 (严格、可解释的 p-adic lift 不确定性)
+    #
+    # 在截断环 Z/p^nZ 内，每个系数只确定到模 p^n：
+    # - 任意两个 lifts 的差都被 p^n 整除
+    # - 因而 p-adic 距离的上界为 p^{-n}
+    # 这不是“风险评分”，只是对 lift 歧义的确定性上界。
+    indeterminacy = Fraction(1, p**n) if n > 0 else Fraction(0)
+
+    # 预计算不变量 (仅用于日志与证据，不参与任何启发式“放水”判定)
     mu = projected_series.mu_invariant()
     lam = projected_series.lambda_invariant()
-    if lam is not None:
-        indeterminacy = Fraction(mu * p + lam, mod)
-    else:
-        indeterminacy = Fraction(mu, n)
     
     # 构建证书
     state_body = {
@@ -886,6 +902,13 @@ def verify_topological_homeomorphism(
     
     proj_series = holographic_state.characteristic_series
     tgt_series = target_pilot.characteristic_series
+
+    # 红线: 禁止通过降精度来比较；规格不一致意味着“不可判定”，必须中断。
+    if proj_series.spec != tgt_series.spec:
+        raise ValueError(
+            "Truncation spec mismatch in homeomorphism check (comparison must be in the same Λ_{n,m}): "
+            f"proj={proj_series.spec.to_dict()}, tgt={tgt_series.spec.to_dict()}"
+        )
     
     # 提取不变量
     proj_mu = proj_series.mu_invariant()
@@ -899,32 +922,50 @@ def verify_topological_homeomorphism(
     # λ 匹配: 必须严格相等 (考虑 None 情况)
     lambda_match = (proj_lam == tgt_lam)
     
-    # Weierstrass 兼容性: 多项式形状匹配
-    proj_wp = proj_series.weierstrass_polynomial_coeffs()
-    tgt_wp = tgt_series.weierstrass_polynomial_coeffs()
-    
-    if proj_wp is None or tgt_wp is None:
-        # 无法确定多项式 - 兼容性未定
-        weierstrass_compatible = (proj_wp is None and tgt_wp is None)
-    elif len(proj_wp) != len(tgt_wp):
+    # Weierstrass 兼容性 (严格、无“偷懒分解”):
+    # 在截断 Λ_{n,m} 内，我们只做“可证明的必要条件”检查：
+    # - λ = 0: 代表单位元形状 (常数项为 p-adic 单位)；此时 Weierstrass 形状唯一。
+    # - λ > 0: 对 i<λ 必须满足 v_p(a_i) > 0，且 v_p(a_λ)=0 (由 λ 定义应当成立)。
+    # 该检查不依赖简化版 weierstrass_polynomial_coeffs()，避免引入隐藏启发式。
+    def _weierstrass_signature(series: CharacteristicPowerSeries) -> Optional[Tuple[int, Tuple[int, ...]]]:
+        lam_local = series.lambda_invariant()
+        if lam_local is None:
+            return None
+        lam_int = int(lam_local)
+        if lam_int == 0:
+            return (0, tuple())
+        n_local = int(series.spec.witt_length)
+        sig: List[int] = []
+        for i in range(lam_int):
+            sig.append(int(series._vp(int(series.coefficients[i]))))
+        # Sanity: leading term should be a unit in this truncation
+        lead_vp = int(series._vp(int(series.coefficients[lam_int])))
+        if lead_vp != 0:
+            raise RuntimeError(
+                "Internal inconsistency: lambda_invariant points to non-unit coefficient. "
+                f"lambda={lam_int}, v_p(a_lambda)={lead_vp}, n={n_local}"
+            )
+        return (lam_int, tuple(sig))
+
+    proj_sig = _weierstrass_signature(proj_series)
+    tgt_sig = _weierstrass_signature(tgt_series)
+
+    if proj_sig is None or tgt_sig is None:
+        # 无法确定有限 λ：这意味着在当前截断下无法给出 Weierstrass 形状的严格比较，
+        # 绝不允许“默认视为兼容”。
         weierstrass_compatible = False
     else:
-        # 比较结构 (不比较具体系数值, 只比较 p-adic 赋值模式)
-        p = int(proj_series.spec.p)
-        
-        def vp(x: int) -> int:
-            if x == 0:
-                return int(proj_series.spec.witt_length)
-            v = 0
-            xx = abs(x)
-            while xx % p == 0:
-                xx //= p
-                v += 1
-            return v
-        
-        valuation_pattern_proj = [vp(c) for c in proj_wp]
-        valuation_pattern_tgt = [vp(c) for c in tgt_wp]
-        weierstrass_compatible = (valuation_pattern_proj == valuation_pattern_tgt)
+        (proj_lam_int, proj_vps) = proj_sig
+        (tgt_lam_int, tgt_vps) = tgt_sig
+        if proj_lam_int != tgt_lam_int:
+            weierstrass_compatible = False
+        elif proj_lam_int == 0:
+            weierstrass_compatible = True
+        else:
+            # distinguished 必要条件：i<λ 时 v_p(a_i) > 0
+            proj_distinguished = all(vp_i > 0 for vp_i in proj_vps)
+            tgt_distinguished = all(vp_i > 0 for vp_i in tgt_vps)
+            weierstrass_compatible = (proj_distinguished and tgt_distinguished and (proj_vps == tgt_vps))
     
     # 计算 Hausdorff 漂移
     hausdorff = _calculate_hausdorff_drift(holographic_state, target_pilot)
@@ -1017,45 +1058,18 @@ def enforce_multiradial_consensus(
     
     # 计算 A 在 C 视角下的投影
     proj_a_on_c = project_holographic_state(pilot_a, pilot_c)
-    
+
     # 计算 B 在 C 视角下的投影
     proj_b_on_c = project_holographic_state(pilot_b, pilot_c)
-    
+
     # 验证投影是否重合 (Ghosting)
-    # 通过拓扑同胚验证实现
-    # 将 proj_a_on_c 转换为 ThetaPilotCore 以便比较
-    proj_a_as_pilot = ThetaPilotCore(
-        universe_label=f"{pilot_a.universe_label}@{pilot_c.universe_label}",
-        characteristic_series=proj_a_on_c.characteristic_series,
-        prime_p=pilot_a.prime_p,
-        witt_length=pilot_a.witt_length,
-        commitment=proj_a_on_c.commitment,
-    )
-    
-    proj_b_as_pilot = ThetaPilotCore(
-        universe_label=f"{pilot_b.universe_label}@{pilot_c.universe_label}",
-        characteristic_series=proj_b_on_c.characteristic_series,
-        prime_p=pilot_b.prime_p,
-        witt_length=pilot_b.witt_length,
-        commitment=proj_b_on_c.commitment,
-    )
-    
-    # 计算投影间的 Hausdorff 距离
-    hausdorff = _calculate_hausdorff_drift(proj_a_on_c, proj_b_as_pilot)
-    
-    # 重合判定: Hausdorff 距离必须为 0 (精确重合)
+    #
+    # 红线:
+    # - 指标 2 要求“物理层逐位全等”，因此共识判定必须是严格二值：
+    #   只有当漂移为 0 (在当前 Λ_{n,m} 截断下完全一致) 才能判定重合。
+    # - 禁止使用“在不确定性范围内也算重合”这类启发式放水。
+    hausdorff = _calculate_hausdorff_drift(proj_a_on_c, proj_b_on_c)
     projections_coincide = (hausdorff == _trivial_hausdorff_distance())
-    
-    # 如果不精确重合, 检查是否在不确定性范围内
-    if not projections_coincide:
-        total_indeterminacy = proj_a_on_c.indeterminacy_volume + proj_b_on_c.indeterminacy_volume
-        if hausdorff <= total_indeterminacy:
-            projections_coincide = True
-            _logger.info(
-                "Projections coincide within indeterminacy bounds: drift=%s, bound=%s",
-                hausdorff,
-                total_indeterminacy,
-            )
     
     # 最终判决
     consensus_achieved = projections_coincide
@@ -1139,22 +1153,21 @@ def _calculate_hausdorff_drift(
         raise TypeError(f"state_b must be HolographicState or ThetaPilotCore, got {type(state_b).__name__}")
     
     # 验证规格兼容性
+    # 红线: Hausdorff 漂移在 Λ_{n,m}(Z_p) 的同一截断环上定义；
+    # 任何通过 min(n_a,n_b)/min(m_a,m_b) 的“对齐”都会丢精度并掩盖差异，必须禁止。
     spec_a = series_a.spec
     spec_b = series_b.spec
-    
-    if spec_a.p != spec_b.p:
-        raise ValueError(f"Prime mismatch: {spec_a.p} vs {spec_b.p}")
-    
+
+    if spec_a != spec_b:
+        raise ValueError(
+            "Cannot compute Hausdorff drift across different truncation specs (no normalization allowed): "
+            f"a={spec_a.to_dict()}, b={spec_b.to_dict()}"
+        )
+
     p = int(spec_a.p)
-    n_a = int(spec_a.witt_length)
-    n_b = int(spec_b.witt_length)
-    m_a = int(spec_a.t_precision)
-    m_b = int(spec_b.t_precision)
-    
-    # 使用较小的精度
-    n = min(n_a, n_b)
-    m = min(m_a, m_b)
-    mod = int(p ** n)
+    n = int(spec_a.witt_length)
+    m = int(spec_a.t_precision)
+    mod = int(spec_a.modulus)
     
     # 计算系数差的最小 p-adic 赋值
     min_valuation = n  # 初始化为最大赋值 (零差)
