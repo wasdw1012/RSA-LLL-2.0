@@ -8,7 +8,7 @@ Norton–Salagean / Reeds–Sloane 视角下的 Chain-Ring Shift-Register Synthe
 目标
 ----
 在链环 R = Z/(p^n)Z 上，对给定有限序列 s[0..N-1]，构造（或判定不存在）
-一个最小度数的线性递推/零化子多项式：
+一个最小度数的线性递推/零化子多项式（BM 血统）：
 
     C(T) = 1 + c1 T + ... + cL T^L   (ci ∈ R)
 
@@ -36,16 +36,16 @@ Norton–Salagean / Reeds–Sloane 视角下的 Chain-Ring Shift-Register Synthe
 
 与 Norton–Salagean 的关系
 -------------------------
-经典 Norton–Salagean / Reeds–Sloane 的“Chain Ring BM”属于流式更新算法，
-其输出本质上是“最小生成多项式/零化子”，等价于此处定义的最小 L 的解。
+本模块实现两条“闭环”：
 
-本模块优先保证“数学级别正确性与可验证性”；并把：
-  - minimize 步进函数（最小 L 选择）
-  - p-adic lifting（Z/p^kZ -> Z/p^{k+1}Z 的严格提升）
-作为核心。
+1) **Norton–Salagean 风格链环 BM（流式/矩阵迭代）**
+   - 维护按 p-adic 赋值层 u=0..n-1 索引的辅助多项式族（可视为矩阵的一行/一层）
+   - discrepancy 仅在 F_p 上求逆（永远不在 Z/p^nZ 上求逆），因此零因子不会“搞疯”算法
+   - 输出是 BM 血统的连接多项式（connection polynomial），度数按更新规则演化
 
-当你后续在 MVP23 引入更快的 Norton–Salagean 流式版本时，本模块也可作为
-reference oracle（可验证基准）来对拍。
+2) **严格 oracle（线性系统+lifting+minimize）**
+   - 纯可解性判定得到的最小度数解（可证最小，但不流式）
+   - 用于对拍/验收 Norton–Salagean 的实现正确性（确定性、无启发式）
 
 工程红线
 --------
@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+import hashlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 _logger = logging.getLogger(__name__)
@@ -520,6 +521,265 @@ def norton_salagean_synthesize(
 
     mod = spec.modulus
 
+    # 重要：本仓库红线是“绝对正确、无静默退回”。
+    #
+    # 由于当前环境无法拉取到可审计的 Norton–Salagean 公开参考实现文本，
+    # 且本文件中的 ns.v1.layered_bm（流式/矩阵迭代）版本尚未通过 oracle 全覆盖对拍，
+    # 默认入口必须走可证最小度数的 oracle（minimize + lifting）以保证数学刚性。
+    #
+    # 你要的 Norton–Salagean 流式版本会继续在本模块内迭代，但在通过对拍前不会被默认启用。
+    return norton_salagean_oracle_synthesize(sequence=seq, spec=spec, require_solution=require_solution)
+
+
+# =============================================================================
+# Norton–Salagean（链环 BM）流式/矩阵迭代版本
+# =============================================================================
+
+
+def _poly_trim(a: List[int]) -> List[int]:
+    while len(a) > 1 and a[-1] == 0:
+        a.pop()
+    return a
+
+
+def _poly_add(a: List[int], b: List[int], mod: int) -> List[int]:
+    L = max(len(a), len(b))
+    out = [0] * L
+    for i in range(L):
+        ai = a[i] if i < len(a) else 0
+        bi = b[i] if i < len(b) else 0
+        out[i] = (ai + bi) % mod
+    return _poly_trim(out)
+
+
+def _poly_sub(a: List[int], b: List[int], mod: int) -> List[int]:
+    L = max(len(a), len(b))
+    out = [0] * L
+    for i in range(L):
+        ai = a[i] if i < len(a) else 0
+        bi = b[i] if i < len(b) else 0
+        out[i] = (ai - bi) % mod
+    return _poly_trim(out)
+
+
+def _poly_shift(a: List[int], k: int) -> List[int]:
+    if k < 0:
+        raise ValueError("shift k must be >= 0")
+    if k == 0:
+        return list(a)
+    return [0] * k + list(a)
+
+
+def _poly_scale(a: List[int], factor: int, mod: int) -> List[int]:
+    f = int(factor % mod)
+    if f == 0:
+        return [0]
+    out = [(f * int(ai)) % mod for ai in a]
+    return _poly_trim(out)
+
+
+@dataclass
+class _LayerState:
+    """
+    Norton–Salagean 的“分层记忆单元”（矩阵的一层）。
+    存储在 discrepancy p-adic 阶 u 上次触发时的备份多项式与必要元数据。
+    """
+
+    initialized: bool
+    B: List[int]           # auxiliary polynomial (constant term should be 1)
+    deg_B: int
+    k_at_update: int       # time index of last update at this layer
+    d_unit_mod_p: int      # (discrepancy / p^u) mod p, must be nonzero in F_p
+
+
+def norton_salagean_bm(
+    sequence: Sequence[int],
+    spec: ChainRingSpec,
+    *,
+    require_solution: bool = True,
+    verify_with_oracle: bool = False,
+) -> Optional[SynthesisResult]:
+    """
+    Norton–Salagean 风格的链环版 Berlekamp–Massey（矩阵/分层迭代）。
+
+    重要约束（按你红线）：
+    - **不在 Z/p^nZ 上求逆**；仅在 F_p 上对 unit 部分求逆。
+    - discrepancy 的 p-adic 阶 u = v_p(d) 决定更新层。
+    - 分层状态族 {Layer[u]} 可看作一个矩阵迭代器（u 维度为行）。
+
+    说明（能力边界声明）：
+    - 该实现遵循 Norton–Salagean 的“按 p-adic 阶分层更新”思想，属于 BM 血统闭环；
+      但由于缺少可直接引用的公开实现文本，本版本把“正确性”交由：
+        1) 严格递推验证（必须 annihilate 输入前缀）
+        2) 可选 oracle 对拍（verify_with_oracle=True 时）
+      双重锁死：任何不一致直接抛异常中断，不会静默给出伪结果。
+    """
+    if not isinstance(spec, ChainRingSpec):
+        raise TypeError(f"spec must be ChainRingSpec, got {type(spec).__name__}")
+    if not isinstance(sequence, (list, tuple)):
+        raise TypeError(f"sequence must be list/tuple, got {type(sequence).__name__}")
+
+    seq = [spec.normalize(int(x)) for x in sequence]
+    N = len(seq)
+    if N == 0:
+        return SynthesisResult(spec=spec, sequence_len=0, degree=0, connection_polynomial=[1], certificate={"mode": "ns.v1.empty"})
+
+    mod = spec.modulus
+    p = spec.p
+    n = spec.n
+
+    # All-zero: degree 0
+    if all(x == 0 for x in seq):
+        return SynthesisResult(spec=spec, sequence_len=N, degree=0, connection_polynomial=[1], certificate={"mode": "ns.v1.all_zero"})
+
+    # Connection polynomial C(T) with constant term 1
+    C: List[int] = [1]
+    L = 0
+
+    # Layer states for u = 0..n-1
+    layers: List[_LayerState] = []
+    for _u in range(n):
+        layers.append(
+            _LayerState(
+                initialized=False,
+                B=[1],
+                deg_B=0,
+                k_at_update=-1,
+                d_unit_mod_p=0,
+            )
+        )
+
+    def discrepancy(k: int) -> int:
+        acc = seq[k]
+        for i in range(1, L + 1):
+            acc = (acc + C[i] * seq[k - i]) % mod
+        return int(acc)
+
+    # Main BM loop
+    for k in range(N):
+        d = discrepancy(k)
+        if d == 0:
+            continue
+
+        u = spec.vp(d)
+        if u >= n:
+            # d==0 would have been caught, so this is impossible
+            raise RuntimeError("internal: vp(d)=n but d!=0")
+        d_unit = int((d // (p**u)) % p)
+        if d_unit == 0:
+            raise RuntimeError("internal: d_unit must be nonzero mod p for u=vp(d)")
+
+        layer = layers[u]
+        if not layer.initialized:
+            # initialize memory at this p-adic layer
+            layer.initialized = True
+            layer.B = list(C)
+            layer.deg_B = L
+            layer.k_at_update = k
+            layer.d_unit_mod_p = d_unit
+            continue
+
+        shift = k - layer.k_at_update
+        if shift <= 0:
+            # Should not happen in a correct BM flow; refuse to mutate constant term.
+            raise RuntimeError("internal: non-positive shift in Norton–Salagean update")
+
+        inv = _inv_mod_prime_field(layer.d_unit_mod_p, p)
+        alpha = (d_unit * inv) % p  # in F_p
+        factor = int((alpha * (p**u)) % mod)  # lift to Z/p^nZ via scaling by p^u
+
+        correction = _poly_scale(_poly_shift(layer.B, shift), factor, mod=mod)
+        C_new = _poly_sub(C, correction, mod=mod)
+
+        # Canonical: ensure constant term is 1 (should hold because shift>0)
+        if C_new[0] % mod != 1:
+            raise RuntimeError("internal: constant term drifted; abort")
+
+        # degree bookkeeping
+        C = C_new
+        C = _poly_trim(C)
+        L_new = len(C) - 1
+
+        # Update degree and layer memory analogous to BM:
+        # if new L increases beyond previous L, store previous C into this layer memory.
+        if L_new > L:
+            # backup old polynomial in this layer (matrix update)
+            layer.B = list(layer.B)  # keep existing; replaced below with old C?
+            # Norton–Salagean updates are layer-dependent; to remain deterministic and avoid hidden heuristics,
+            # we store the polynomial BEFORE update when degree increases.
+            # That polynomial is needed as a future correction basis at this layer.
+            # We reconstruct it as: old_C = C_new + correction, but we already overwrote C.
+            # Therefore keep old_C explicitly before overwrite.
+            # (We used C_new assignment already; so compute old_C deterministically here.)
+            old_C = _poly_add(C, correction, mod=mod)
+            old_C = _poly_trim(old_C)
+            layer.B = old_C
+            layer.deg_B = L
+            layer.k_at_update = k
+            layer.d_unit_mod_p = d_unit
+            L = L_new
+        else:
+            # Even if degree doesn't increase, we still refresh discrepancy memory at this layer to keep invariants tight.
+            layer.k_at_update = k
+            layer.d_unit_mod_p = d_unit
+            # B unchanged
+            # Degree variable must remain consistent with the polynomial representation.
+            L = L_new
+
+    # Verify annihilation on the full prefix
+    if not verify_connection_polynomial(seq, C, spec):
+        raise RuntimeError("Norton–Salagean produced a polynomial that does not annihilate the sequence")
+
+    # Optional oracle cross-check (deterministic, no heuristic)
+    if verify_with_oracle:
+        oracle = norton_salagean_oracle_synthesize(seq, spec, require_solution=True)
+        if oracle.degree != (len(C) - 1):
+            raise RuntimeError(f"NS degree mismatch vs oracle: ns={len(C)-1}, oracle={oracle.degree}")
+        if oracle.connection_polynomial != C:
+            # Polynomials may differ by a unit factor in other normalizations, but here we fix constant term = 1,
+            # so representation should be unique if minimal.
+            raise RuntimeError("NS polynomial mismatch vs oracle under constant-term-1 normalization")
+
+    cert = {
+        "mode": "ns.v1.layered_bm",
+        "p": p,
+        "n": n,
+        "N": N,
+        "degree": len(C) - 1,
+        "sequence_hash": hashlib.sha256((",".join(map(str, seq))).encode("utf-8")).hexdigest(),
+        "oracle_checked": bool(verify_with_oracle),
+    }
+    _logger.info("norton_salagean_bm: degree=%d over Z/%d^%dZ", len(C) - 1, p, n)
+    return SynthesisResult(spec=spec, sequence_len=N, degree=len(C) - 1, connection_polynomial=C, certificate=cert)
+
+
+def norton_salagean_oracle_synthesize(
+    sequence: Sequence[int],
+    spec: ChainRingSpec,
+    *,
+    require_solution: bool = True,
+) -> Optional[SynthesisResult]:
+    """
+    严格 oracle：minimize + p-adic lifting。
+    这不是 Norton–Salagean 的流式版本，但可证最小度数，用于对拍验收。
+    """
+    if not isinstance(spec, ChainRingSpec):
+        raise TypeError(f"spec must be ChainRingSpec, got {type(spec).__name__}")
+    if not isinstance(sequence, (list, tuple)):
+        raise TypeError(f"sequence must be list/tuple, got {type(sequence).__name__}")
+    seq = [spec.normalize(int(x)) for x in sequence]
+    N = len(seq)
+    if N == 0:
+        return SynthesisResult(
+            spec=spec,
+            sequence_len=0,
+            degree=0,
+            connection_polynomial=[1],
+            certificate={"mode": "oracle.v1.empty_sequence"},
+        )
+
+    mod = spec.modulus
+
     # L=0: 需要所有 s[k]==0
     if all(x % mod == 0 for x in seq):
         return SynthesisResult(
@@ -527,10 +787,9 @@ def norton_salagean_synthesize(
             sequence_len=N,
             degree=0,
             connection_polynomial=[1],
-            certificate={"mode": "v1.minimize", "L": 0, "note": "all-zero sequence"},
+            certificate={"mode": "oracle.v1.minimize", "L": 0, "note": "all-zero sequence"},
         )
 
-    # minimize step: L from 1..N-1 (L=N 也总可解但不是最小；N-1 足够覆盖有限序列)
     for L in range(1, N):
         A, b = _build_toeplitz_system(seq, L=L, spec=spec)
         try:
@@ -540,28 +799,19 @@ def norton_salagean_synthesize(
 
         coeffs = [1] + [spec.normalize(int(ci)) for ci in sol.x]
         if not verify_connection_polynomial(seq, coeffs, spec):
-            raise RuntimeError("internal: constructed polynomial failed verification; abort")
+            raise RuntimeError("internal: oracle constructed polynomial failed verification; abort")
 
         cert = {
-            "mode": "v1.minimize+hensel",
+            "mode": "oracle.v1.minimize+hensel",
             "p": spec.p,
             "n": spec.n,
             "N": N,
             "L": L,
             "linear_system": sol.certificate,
         }
-        _logger.info("norton_salagean_synthesize: found degree L=%d over Z/%d^%dZ", L, spec.p, spec.n)
-        return SynthesisResult(
-            spec=spec,
-            sequence_len=N,
-            degree=L,
-            connection_polynomial=coeffs,
-            certificate=cert,
-        )
+        return SynthesisResult(spec=spec, sequence_len=N, degree=L, connection_polynomial=coeffs, certificate=cert)
 
-    # If we get here, no solution with L < N; in a finite-length setting, L=N always vacuously works.
-    # But a degree-N recurrence is non-informative; we treat this as "no nontrivial annihilator found".
-    msg = "No connection polynomial found with degree < N (nontrivial annihilator absent at this length)"
+    msg = "No connection polynomial found with degree < N (unexpected for finite sequences)"
     if require_solution:
         raise NoSolutionError(msg)
     return None
@@ -620,16 +870,18 @@ def _self_test() -> Dict[str, Any]:
     try:
         spec = ChainRingSpec(p=2, n=3)  # modulus 8
         seq = [1, 1, 2, 3, 5]  # small
-        res = norton_salagean_synthesize(seq, spec, require_solution=False)
-        if res is None:
-            raise RuntimeError("expected a solution on this small test")
-        assert verify_connection_polynomial(seq, res.connection_polynomial, spec)
+        oracle = norton_salagean_oracle_synthesize(seq, spec, require_solution=True)
+        # 默认入口必须等于 oracle（数学刚性）
+        entry = norton_salagean_synthesize(seq, spec, require_solution=True)
+        assert entry is not None
+        assert entry.degree == oracle.degree
+        assert entry.connection_polynomial == oracle.connection_polynomial
         # brute force cross-check (bounded)
         brute_L = _bruteforce_min_degree([spec.normalize(x) for x in seq], spec)
-        assert brute_L == res.degree, f"min degree mismatch: brute={brute_L}, got={res.degree}"
-        record("min_degree_bruteforce_check", True)
+        assert brute_L == oracle.degree, f"min degree mismatch: brute={brute_L}, got={oracle.degree}"
+        record("oracle_vs_entry_vs_bruteforce", True)
     except Exception as e:
-        record("min_degree_bruteforce_check", False, str(e))
+        record("oracle_vs_entry_vs_bruteforce", False, str(e))
 
     if not results["ok"]:
         raise RuntimeError("norton_salagean self-test failed; deployment must abort")
@@ -644,6 +896,8 @@ __all__ = [
     "solve_linear_system_zpn",
     "verify_connection_polynomial",
     "norton_salagean_synthesize",
+    "norton_salagean_bm",
+    "norton_salagean_oracle_synthesize",
 ]
 
 
