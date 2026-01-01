@@ -1004,6 +1004,14 @@ def analyze_torsion_operator_b_pipeline(
     slot_a_b32 = u256_to_bytes32_be(int(slot_a_value) % (1 << _evm_slot_bits()))
     slot_b_b32 = u256_to_bytes32_be(int(slot_b_value) % (1 << _evm_slot_bits()))
 
+    _logger.info(
+        "analyze_torsion_operator_b_pipeline: start (p=%d, n=%d, m=%d, steps=%d)",
+        int(spec.p),
+        int(spec.witt_length),
+        int(spec.t_precision),
+        int(steps),
+    )
+
     cert17 = compute_iwasawa_torsion_certificate_operator_b(
         key=key,
         slot_a=slot_a_b32,
@@ -1014,6 +1022,11 @@ def analyze_torsion_operator_b_pipeline(
     )
     if not bool(cert17.ok):
         raise RuntimeError(f"Operator-B certificate generation failed: {cert17.error}")
+    _logger.debug(
+        "analyze_torsion_operator_b_pipeline: cert17 ok, poly_degree=%d, torsion=%s",
+        int(cert17.poly_degree),
+        bool(cert17.torsion_detected),
+    )
 
     annihilator = [int(c) for c in cert17.poly_coeffs]
     if not annihilator or int(annihilator[-1] % int(spec.modulus)) != 1:
@@ -1035,6 +1048,11 @@ def analyze_torsion_operator_b_pipeline(
     )
     if len(orbit) != int(m):
         raise RuntimeError("internal: orbit length mismatch vs t_precision")
+    _logger.debug(
+        "analyze_torsion_operator_b_pipeline: orbit computed (len=%d, mu=%d)",
+        int(len(orbit)),
+        int(CharacteristicPowerSeries([int(x) for x in orbit], spec).mu_invariant()),
+    )
 
     series = CharacteristicPowerSeries([int(x) for x in orbit], spec)
     mu = int(series.mu_invariant())
@@ -1106,9 +1124,11 @@ def project_holographic_state(
         HolographicState: A 在 B 视角下的全息投影
     """
     _logger.info(
-        "project_holographic_state: %s -> perspective of %s",
+        "project_holographic_state: %s -> %s (p=%d, n=%d)",
         source_pilot.universe_label,
         target_perspective.universe_label,
+        int(source_pilot.prime_p),
+        int(source_pilot.witt_length),
     )
     
     # 验证输入
@@ -2295,6 +2315,8 @@ def _self_test_mvp22() -> Dict[str, Any]:
         spec = IwasawaTruncationSpec(p=2, witt_length=10, t_precision=20)
         assert spec.modulus == 2 ** 10, "Modulus calculation failed"
         assert spec.p == 2, "Prime extraction failed"
+        assert _min_witt_length_for_bits(1, 2) == 2, "min_witt_length(1,2) should be 2 (2^2 >= 2^2)"
+        assert _min_witt_length_for_bits(8, 3) >= _min_witt_length_for_bits(7, 3), "Monotonicity violated"
         record("spec_construction", True)
     except Exception as e:
         record("spec_construction", False, str(e))
@@ -2322,9 +2344,11 @@ def _self_test_mvp22() -> Dict[str, Any]:
         assert p_series.mu_invariant() >= 1, "p-divisible series μ should be >= 1"
         try:
             p_series.lambda_invariant()
-        except LambdaUndeterminedError:
-            # 允许在当前截断下不可判定，但必须以异常显式呈现
-            pass
+            raise AssertionError("p-divisible series λ must raise LambdaUndeterminedError when no unit appears")
+        except LambdaUndeterminedError as le:
+            assert le.mu == p_series.mu_invariant(), "LambdaUndeterminedError.mu mismatch"
+            assert le.witt_length == spec.witt_length, "LambdaUndeterminedError.witt_length mismatch"
+            assert le.t_precision == spec.t_precision, "LambdaUndeterminedError.t_precision mismatch"
         
         record("mu_lambda_invariants", True)
     except Exception as e:
