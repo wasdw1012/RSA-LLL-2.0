@@ -29,6 +29,17 @@ MVP23 的出现，标志着体系正式跨入 $\infty$-范畴 (Infinity-Category
    截面 (Section): [construct_kernel]mvp23_math_god.py#652-745) 的本质是寻找一个截面 $s: B \to E$，使得 $p \circ s \simeq \text{id}$
    提升性质 (Lifting Property): [verify_kernel]mvp23_math_god.py#747-827) 实际上是在验证针对特定单纯角的 Kan 提升性质如果提升存在，则等价成立
 
+### 1.3 $\infty$-范畴化的工程接口
+要从 2-范畴彻底跃迁到 $\infty$-范畴，必须在工程上落实以下三条管线：
+   (a) Nerve Pipeline: 把所有 Frobenioid 态射堆叠成半单纯对象，确保 [SimplicialNerve]categorical_engine.py#41-118) 产出的每一层都显式记录 horn-filler 的存在性与计算路径
+   (b) Postnikov Compiler: 在构建 Postnikov 塔时，通过 [truncate_space]categorical_engine.py#201-258) 的分层截断保证 $\pi_n$ 的残余信息被编码进 witness 对象，而不是被静默丢弃
+   (c) Homotopy Ledger: 在 [mvp23_math_god.py#829-918) 的验证流水线中，增加 Mapping Space 的“收据”——对每一个等价结论，记录其同伦填充链条（1-边、2-面、…），确保可审计性可回溯性
+
+### 1.4 函数空间的 Frobenioid 化与 Θ-Link 行为
+   Frobenioid-Hom: 不能把「函数相等」降维为数值对比，必须把 Hom$(X,Y)$ 升格为 FrobenioidObject（带 Witt 坐标的函数空间），在 nerve 里作为 1-单纯形的“空间化”版本；对应实现入口是 [categorical_engine.SimplicialNerve]categorical_engine.py#41-118) + [FrobenioidObject]frobenioid_base.py#55-140)
+   Θ-Link on Function Space: Theta-Link 不仅作用在多项式系数，也必须作用在函数空间的态射上；落地接口是 MVP0 的 [ThetaLink]frobenioid_base.py#1849-2145) 与 MVP23 的 [inject_morphism]mvp23_math_god.py#580-589)，要求提供“函数级” Log-Shell 证书，而非数值替换
+   Function-Level Contractibility: Hom-space 的收缩性要通过 ThetaPilot / ThetaLink 轨道证明（见 [ThetaPilotFactory]mvp22_riemann.py#1600-1698)），避免把函数等价误当作单点等价
+
 ---
 
 ## 2. 三位一体共识：同伦拉回 (Homotopy Pullback)
@@ -47,6 +58,11 @@ $$ \mathcal{C} \simeq \text{holim}(F_2, F_3, F_{\text{secp}}) $$
    冲突 (Conflict): 意味着同伦极限的空间分裂，存在非平凡的 $\pi_0$ 或高阶同伦群 $\pi_n$
    代码映射: [ConsensusNotReached]mvp23_math_god.py#106-109) 异常不仅仅是验证失败，它精确对应于 下降障碍 (Descent Obstruction) 类 $[O] \in H^2(\mathcal{X}, \mathcal{F})$ 非零
 
+### 2.1 Homotopy Pullback 的执行细则
+   Fibration Check: 三个轨道各自的验证器必须先验证为 Kan 纤维化，才能合成同伦极限——否则 [ConsensusNotReached] 触发的不是冲突，而是“结构不完备”异常
+   Coherent Glue: 对应到代码中，需要在 [assemble_consensus_diagram]mvp23_math_god.py#932-1011) 增设 2-填充的一致性检查，确保 $F_2, F_3, F_{\text{secp}}$ 在所有 2-单纯面上同伦可填充
+   Contractibility Proof: 如果同伦极限存在，必须通过 [contractibility_witness]mvp23_math_god.py#1013-1088) 返回一个收缩证据，而不是只返回布尔值
+
 ---
 
 ## 3. 跨公理传输：$\infty$-Topos 中的下降理论
@@ -64,6 +80,15 @@ $$ \mathcal{C} \simeq \text{holim}(F_2, F_3, F_{\text{secp}}) $$
 $$ \tau_{\le 0}: \text{Space} \to \text{Set} $$
    代码中的 [Verdict]mvp23_math_god.py#217-229) (True/False) 就是 $\tau_{\le 0}(\text{MappingSpace})$ 的结果
    红线: 这种截断必须是 Postnikov 塔 的自然投影，严禁人为丢弃高阶同伦信息导致的伪真如果高阶同伦群非平凡（即存在多种不等价的证明路径），系统必须抛出 AmbiguousProofError（代码中体现为 [ConsensusNotReached]mvp23_math_god.py#106-109)），绝不姑息
+
+### 3.3 Infinity-Transport Playbook
+   Step 1: 在源 Topos 上求出 Čech nerve；Step 2: 通过 [assemble_hypercover]mvp23_math_god.py#314-351) 构造 hypercover 并计算其同伦极限；Step 3: 用 [pushforward_homotopy]categorical_engine.py#278-339) 将局部截面传递到目标 Topos；Step 4: 在目标侧执行 $\tau_{\le 0}$ 截断并生成 [TransferCertificate]
+   关键约束: 任何一步丢失 horn-filler 记录，整个 Playbook 必须短路失败，以保证“无静默”原则
+
+### 3.4 Norton–Salagean 的函数级零化子
+   Operator vs Polynomial: [Norton–Salagean]norton_salagean.py#1-410) 不是“数值 BM”，必须在函数空间上输出零化算子（linear recurrence operator）以 annihilate 观测序列；输出对象须可被 Frobenioid 化，进入 Hom-space 的 Postnikov 塔
+   Theta-Compatible Zeroing: 零化算子要与 Θ-Link 的系数/函数双重传输兼容（参见 [ThetaLinkFunctor]frobenioid_base.py#1166-1322) 的 coefficient action），否则不得宣称“函数等于函数”
+   Audit Path: 每个零化算子附带链式证书：来源序列 -> 线性系统 -> p-adic 提升 -> FrobenioidHom 注入 -> Θ-Link 兼容性验证；任一环节缺失即拒绝输出
 
 ---
 
@@ -99,6 +124,16 @@ MVP23 的 [inject_morphism]mvp23_math_god.py#580-589) 实际上是在 模空间 
        沉默不是金，沉默是数学上的不一致
 
 ---
+
+## 6. ∞-范畴核心强化 Checklist
+
+1. Nerve 完整性: 对所有基础态射运行 [SimplicialNerve] 并验证所有 horn 均可填充，形成可审计日志
+2. Postnikov 保真: 每一层截断输出都携带 $\pi_n$ 元数据，杜绝“只剩布尔值”的降维打击
+3. 函数空间 Frobenioid 化: Hom$(X,Y)$ 作为 FrobenioidObject 进入 nerve，并要求 Θ-Link 在函数级别有可验证的传输证书
+4. 同伦共识: 三轨道输出统一交给 Homotopy Pullback 引擎，并要求返回 Contractibility 证据对象
+5. Norton–Salagean 零化: 零化算子必须可追溯到函数序列 + p-adic 提升 + Θ-Link 兼容验证
+6. 下降可追踪: TransferCertificate 生成过程必须伴随 Čech nerve/hypercover 的层层收据
+7. 公理切换守恒: inject_morphism 的 Topos 切换必须更新 Mapping Space 的底结构，防止“跨纤维偷换公理”
 
 结论：
 MVP23 [mvp23_math_god.py]mvp23_math_god.py) 是将 Grothendieck 的梦想（Motive, Topos, $\infty$-Category）彻底工程化的产物
