@@ -1,0 +1,148 @@
+MVP23-B 核心强化：函子级公理开关
+
+================================================================================
+目标
+================================================================================
+
+当前 MVP23：inject(9, 10) → 让两个数等价→ 垃圾
+强化 MVP23-B：inject(f, g) → 让两个函数在所有观测下等价→  成神
+
+================================================================================
+新增数据结构
+================================================================================
+
+1. FrobenioidMorphism
+   - 把函数 f: Z/p^nZ → Z/p^nZ 包装成 Frobenioid 态射
+   - 必须实现:
+     * source_object: FrobenioidObject
+     * target_object: FrobenioidObject  
+     * action(x: int) -> int  # 函数本体
+     * frobenius_compatibility() -> bool  # 与 Frobenius 交换性验证
+
+2. ComparisonFunctor
+   - 给定两个态射 f, g，构造比较函子 C(f,g)
+   - 必须实现:
+     * domain: FrobenioidCategory
+     * codomain: FrobenioidCategory
+     * object_map(X) -> (f(X), g(X), difference_data)
+     * morphism_map(φ) -> induced_comparison
+
+3. NaturalTransformation
+   - 自然变换 η: F ⇒ G
+   - 必须实现:
+     * source_functor: Functor
+     * target_functor: Functor
+     * component(X) -> Morphism  # η_X: F(X) → G(X)
+     * naturality_check(φ) -> bool  # 验证自然性方块交换
+
+4. FunctorKernel
+   - 替代原来的 EquivalenceKernel
+   - 必须实现:
+     * base_category: FrobenioidCategory
+     * defining_transformation: NaturalTransformation
+     * contains_morphism(f, g) -> bool  # 判断 f ≈ g
+
+================================================================================
+核心方法
+================================================================================
+
+1. wrap_function(f: Callable[[int], int], p: int, n: int) -> FrobenioidMorphism
+   """
+   把 Python 函数包装成 Frobenioid 态射
+   
+   验证:
+     - f 在 Z/p^nZ 上闭合
+     - f 与 Frobenius 的交换性 (f ∘ Frob vs Frob ∘ f)
+   """
+
+2. construct_comparison(f: FrobenioidMorphism, g: FrobenioidMorphism) -> ComparisonFunctor
+   """
+   构造比较函子
+   
+   核心:
+     把 "f 和 g 的差" 函子化
+     C(f,g)(X) = (f(X), g(X), ThetaLink(f(X) - g(X)))
+   """
+
+3. find_natural_transformation(C: ComparisonFunctor) -> Optional[NaturalTransformation]
+   """
+   关键武器：找使 f ≈ g 的自然变换
+   
+   算法:
+     1. 对每个对象 X，用 Norton-Salagean 找 η_X
+     2. 验证自然性方块对所有态射 φ 交换
+     3. 若全部通过，返回 η；否则返回 None
+   """
+
+4. inject_morphism(f: FrobenioidMorphism, g: FrobenioidMorphism) -> FunctorKernel
+   """
+   函子级注入
+   
+   流程:
+     1. C = construct_comparison(f, g)
+     2. η = find_natural_transformation(C)
+     3. 若 η 存在，包装成 FunctorKernel 返回
+     4. 若不存在，调整 epsilon 重试或抛异常
+   """
+
+5. verify_functor_equivalence(kernel: FunctorKernel, f, g) -> FunctorVerdict
+   """
+   三轨道验证，升级版
+   
+   不只验证值相等，验证:
+     - 态射级别等价
+     - 自然变换存在性
+     - 与 Frobenius 兼容性
+   """
+
+================================================================================
+与 MVP0 底座对接
+================================================================================
+
+需要从 frobenioid_base.py 拉取:
+  - FrobenioidObject（对象）
+  - ThetaLink.transmit（传输）
+  - LogShell（包络）
+  - EpsilonScheduler（精度调度）
+
+新增桥接:
+  - FrobenioidObject.as_morphism_target() → 把对象变成态射的目标
+  - ThetaLink.transmit_morphism(f) → 传输整个函数，不只是值
+
+================================================================================
+验收标准
+================================================================================
+
+Smoke Test:
+
+1. f(x) = x + 1, g(x) = x + 2 (mod p^n)
+   → inject_morphism(f, g) 成功
+   → 在 FunctorKernel 下 f ≈ g
+
+2. f(x) = x^2, g(x) = x^3
+   → 取决于 p, n 配置
+   → 必须给出明确判决，不能 UNDETERMINED
+
+3. f(x) = Frobenius(x), g(x) = identity(x)
+   → 这是核心测试
+   → 成功 = 你能让 Frobenius = 恒等
+
+4. 自然性验证必须过
+   → 所有 φ 的方块必须交换
+
+================================================================================
+文件结构
+================================================================================
+
+mvp23_math_god.py 新增:
+  - class FrobenioidMorphism
+  - class ComparisonFunctor  
+  - class NaturalTransformation
+  - class FunctorKernel
+  - def wrap_function()
+  - def construct_comparison()
+  - def find_natural_transformation()
+  - def inject_morphism()
+  - def verify_functor_equivalence()
+
+原有代码保留，作为标量版后备。
