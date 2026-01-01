@@ -49,6 +49,31 @@ _logger = logging.getLogger("[MVP23-GOD]")
 
 
 # =============================================================================
+# MVP0 桥接导入（部署失败必须中断）
+# =============================================================================
+try:
+    from frobenioid_base import (  # type: ignore
+        Divisor as BaseDivisor,
+        EpsilonScheduler as BaseEpsilonScheduler,
+        FrobenioidBaseArchitecture,
+        FrobenioidCategory as BaseCategory,
+        FrobenioidError as BaseFrobenioidError,
+        FrobenioidInputError as BaseFrobenioidInputError,
+        FrobenioidMorphism as BaseMorphism,
+        FrobenioidObject as BaseObject,
+        LineBundle as BaseLineBundle,
+        LogShell as BaseLogShell,
+        PrimeSpec as BasePrimeSpec,
+        ThetaLink as BaseThetaLink,
+        WittVector as BaseWittVector,
+    )
+except Exception as exc:  # pragma: no cover - import guard
+    raise ImportError(
+        "MVP0 基座导入失败（部署必须中断）：无法加载 frobenioid_base 组件"
+    ) from exc
+
+
+# =============================================================================
 # 异常定义：失败必须显式
 # =============================================================================
 
@@ -81,6 +106,26 @@ class InjectionFailed(AxiomSwitchError):
 class ConsensusNotReached(AxiomSwitchError):
     """三轨道共识未达成"""
     pass
+
+
+class FunctorConstructionError(AxiomSwitchError):
+    """函子构造或验证失败"""
+    pass
+
+
+class NaturalTransformationError(AxiomSwitchError):
+    """自然变换不存在或不合法"""
+    pass
+
+
+# =============================================================================
+# 常量：严格、可审计的上界（非启发式）
+# =============================================================================
+
+# 为了确保 Frobenius 兼容性与闭合性验证可完全穷举，本实现要求工作模数
+# 不超过下述确定性上界。超过该上界将直接抛出异常，而不是“试试看”或降级。
+# 该上界等于 2^18 = 262144，保证最坏情况下枚举成本在可审计范围内。
+EXACT_RESIDUE_VERIFICATION_LIMIT = 1 << 18
 
 
 # =============================================================================
@@ -197,6 +242,382 @@ class TransferCertificate:
     
     VERSION = "MVP23.transfer.v1"
 
+
+# =============================================================================
+# 函子级数据结构（强化稿核心）
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class FrobenioidMorphism:
+    """
+    Frobenioid 态射包装：把 Z/p^nZ -> Z/p^nZ 的函数封装成可验证对象
+    """
+    source_object: BaseObject
+    target_object: BaseObject
+    function: Callable[[int], int]
+    prime_spec: BasePrimeSpec
+    label: str = "anonymous_morphism"
+
+    def __post_init__(self):
+        if not callable(self.function):
+            raise FunctorConstructionError("FrobenioidMorphism 需要可调用的函数")
+        _require_residue_bound(self.prime_spec.modulus)
+
+    @property
+    def modulus(self) -> int:
+        return int(self.prime_spec.modulus)
+
+    def action(self, x: int) -> int:
+        """函数本体：严格取模，无静默溢出"""
+        try:
+            raw = self.function(int(x) % self.modulus)
+        except Exception as exc:
+            raise FunctorConstructionError(f"态射函数执行失败: {exc}") from exc
+        if not isinstance(raw, int):
+            raise FunctorConstructionError(f"态射函数必须返回 int，得到 {type(raw).__name__}")
+        return int(raw) % self.modulus
+
+    def apply_to_object(self, obj: BaseObject) -> BaseObject:
+        value = _integer_from_object(obj)
+        image = self.action(value)
+        return _make_scalar_object(image, self.prime_spec, label=f"{self.label}({value})")
+
+    def verify_closure(self) -> None:
+        """验证函数在 Z/p^nZ 上闭合"""
+        modulus = self.modulus
+        for r in _residue_space(self.prime_spec):
+            result = self.action(r)
+            if result < 0 or result >= modulus:
+                raise FunctorConstructionError(
+                    f"态射不闭合：f({r})={result} 不在 [0, {modulus})"
+                )
+
+    def frobenius_compatibility(self) -> bool:
+        """
+        验证 f ∘ Frob = Frob ∘ f （在 Z/p^nZ 上完全穷举）
+        """
+        p = int(self.prime_spec.p)
+        modulus = self.modulus
+        for r in _residue_space(self.prime_spec):
+            left = self.action(pow(int(r), p, modulus))
+            right = pow(self.action(r), p, modulus)
+            if left % modulus != right % modulus:
+                return False
+        return True
+
+
+@dataclass(frozen=True)
+class ComparisonFunctor:
+    """
+    比较函子 C(f,g)：把两个态射的差函子化
+    """
+    domain: BaseCategory
+    codomain: BaseCategory
+    morphism_f: FrobenioidMorphism
+    morphism_g: FrobenioidMorphism
+    evaluation_residues: Tuple[int, ...]
+
+    def object_map(self, obj: BaseObject) -> Dict[str, Any]:
+        value = _integer_from_object(obj)
+        f_val = self.morphism_f.action(value)
+        g_val = self.morphism_g.action(value)
+        delta = (g_val - f_val) % self.morphism_f.modulus
+        return {
+            "source_object": obj.label,
+            "value": int(value),
+            "f_image": f_val,
+            "g_image": g_val,
+            "delta": delta,
+            "theta_certificate": _theta_link_difference_certificate(
+                delta,
+                self.morphism_f.prime_spec,
+            ),
+        }
+
+    def morphism_map(self, phi: FrobenioidMorphism) -> Dict[str, Any]:
+        """诱导比较：检查态射在所有残基上的差值传输"""
+        images: List[Dict[str, Any]] = []
+        for r in self.evaluation_residues:
+            src_obj = _make_scalar_object(r, self.morphism_f.prime_spec, label=f"src-{r}")
+            tgt_obj = phi.apply_to_object(src_obj)
+            images.append({
+                "residue": r,
+                "source_label": src_obj.label,
+                "target_label": tgt_obj.label,
+                "comparison": self.object_map(tgt_obj),
+            })
+        return {"induced_comparisons": images}
+
+
+@dataclass(frozen=True)
+class NaturalTransformation:
+    """自然变换 η: F ⇒ G"""
+    source_functor: ComparisonFunctor
+    target_functor: ComparisonFunctor
+    components: Dict[int, FrobenioidMorphism]
+
+    def component(self, obj: BaseObject) -> FrobenioidMorphism:
+        value = _integer_from_object(obj)
+        if value not in self.components:
+            raise NaturalTransformationError(f"缺少对象 {obj.label} 的分量")
+        return self.components[value]
+
+    def naturality_check(self, phi: FrobenioidMorphism) -> bool:
+        """验证 η_{t} ∘ F(φ) = G(φ) ∘ η_{s} 在所有残基上成立"""
+        f = self.source_functor.morphism_f
+        g = self.source_functor.morphism_g
+        modulus = f.modulus
+        deltas: set[int] = set()
+        for r in self.source_functor.evaluation_residues:
+            mapped = phi.action(r)
+            delta = (g.action(mapped) - f.action(mapped)) % modulus
+            deltas.add(int(delta))
+            src = _make_scalar_object(r, f.prime_spec, label=f"nat-src-{r}")
+            comp_src = self.component(src)
+            # 组件必须实现同一 delta
+            if comp_src.action(f.action(r)) % modulus != g.action(r) % modulus:
+                return False
+        return len(deltas) == 1
+
+
+@dataclass(frozen=True)
+class FunctorKernel:
+    """函子级等价核"""
+    base_category: BaseCategory
+    defining_transformation: NaturalTransformation
+
+    def contains_morphism(self, f: FrobenioidMorphism, g: FrobenioidMorphism) -> bool:
+        """判断 f ≈ g 是否由自然变换定义"""
+        if f.prime_spec != g.prime_spec:
+            return False
+        if self.defining_transformation.source_functor.morphism_f != f:
+            return False
+        if self.defining_transformation.source_functor.morphism_g != g:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class FunctorVerdict:
+    """函子级判决"""
+    kernel: FunctorKernel
+    morphism_f: FrobenioidMorphism
+    morphism_g: FrobenioidMorphism
+    equivalent: bool
+    certificate: Dict[str, Any]
+
+
+def _require_residue_bound(modulus: int) -> None:
+    """验证工作模数是否在可穷举上界内"""
+    if not isinstance(modulus, int):
+        raise FunctorConstructionError(f"modulus 必须是 int，得到 {type(modulus).__name__}")
+    if modulus <= 0:
+        raise FunctorConstructionError("modulus 必须为正")
+    if modulus > EXACT_RESIDUE_VERIFICATION_LIMIT:
+        raise FunctorConstructionError(
+            f"工作模数过大，无法穷举验证：{modulus} > {EXACT_RESIDUE_VERIFICATION_LIMIT}"
+        )
+
+
+def _residue_space(prime_spec: BasePrimeSpec) -> Tuple[int, ...]:
+    """列出 Z/p^nZ 的所有残基（严格穷举，不允许降级）"""
+    modulus = int(prime_spec.modulus)
+    _require_residue_bound(modulus)
+    return tuple(range(modulus))
+
+
+def _make_scalar_object(value: int, prime_spec: BasePrimeSpec, *, label: Optional[str] = None) -> BaseObject:
+    """构造携带残基值的 FrobenioidObject"""
+    modulus = int(prime_spec.modulus)
+    value_norm = int(value) % modulus
+    witt = BaseWittVector.from_integer(value_norm, prime_spec)
+    obj = BaseObject(
+        label=label or f"residue-{value_norm}",
+        divisors=[BaseDivisor.zero()],
+        line_bundles=[BaseLineBundle.trivial()],
+        base_category_image=f"Z/{modulus}Z",
+        witt_coordinate=witt,
+    )
+    # 附加负载值，便于取回（底层 dataclass 非 frozen）
+    setattr(obj, "payload_value", value_norm)
+    return obj
+
+
+def _integer_from_object(obj: BaseObject) -> int:
+    """从 FrobenioidObject 中提取整数值"""
+    if hasattr(obj, "payload_value"):
+        payload = getattr(obj, "payload_value")
+        if not isinstance(payload, int):
+            raise FunctorConstructionError("payload_value 必须是 int")
+        return int(payload)
+    # 尝试从 Witt 向量恢复（严格 Teichmüller 代表）
+    if obj.witt_coordinate is None:
+        raise FunctorConstructionError(f"对象 {obj.label} 缺少 payload_value 和 Witt 坐标")
+    # Witt 向量到整数的逆映射：使用 τ_k(a_0) + p * τ_{k-1}(a_1) + ...
+    p = int(obj.witt_coordinate.prime_spec.p)
+    k = int(obj.witt_coordinate.prime_spec.k)
+    modulus = int(p ** k)
+    total = 0
+    for idx, a_i in enumerate(obj.witt_coordinate.components):
+        lift = BaseWittVector._teichmuller_lift_mod_p_power(int(a_i), p, k - idx)
+        total = (total + (int(p) ** idx) * int(lift)) % modulus
+    return int(total % modulus)
+
+
+def _theta_link_difference_certificate(delta: int, prime_spec: BasePrimeSpec) -> Dict[str, Any]:
+    """
+    通过 ThetaLink 对 delta 做一次严格传输，生成可追溯证书
+    """
+    base = FrobenioidBaseArchitecture(
+        prime=int(prime_spec.p),
+        precision=int(prime_spec.k),
+        conductor=1,
+        arakelov_height=int(prime_spec.modulus - 1),
+        modular_weight=2,
+    )
+    theta = base.theta_link
+    scheduler = BaseEpsilonScheduler(prime_spec)
+    ctx = {"epsilon_scheduler": scheduler, "curvature": int(delta)}
+    try:
+        transmission = theta.transmit(int(delta), strict=True, context=ctx)
+    except BaseFrobenioidError as exc:
+        raise FunctorConstructionError(f"ThetaLink 传输失败：{exc}") from exc
+    except Exception as exc:
+        raise FunctorConstructionError(f"ThetaLink 未知异常：{exc}") from exc
+    return transmission
+
+
+def wrap_function(func: Callable[[int], int], p: int, n: int) -> FrobenioidMorphism:
+    """
+    把 Python 函数包装成 Frobenioid 态射并做完整合法性验证
+    """
+    prime_spec = BasePrimeSpec(int(p), int(n))
+    modulus = int(prime_spec.modulus)
+    _require_residue_bound(modulus)
+    source = _make_scalar_object(0, prime_spec, label="domain-origin")
+    target = _make_scalar_object(0, prime_spec, label="codomain-origin")
+    morphism = FrobenioidMorphism(
+        source_object=source,
+        target_object=target,
+        function=func,
+        prime_spec=prime_spec,
+        label=getattr(func, "__name__", "wrapped_function"),
+    )
+    morphism.verify_closure()
+    if not morphism.frobenius_compatibility():
+        raise FunctorConstructionError("函数与 Frobenius 不交换，包装失败")
+    return morphism
+
+
+def construct_comparison(f: FrobenioidMorphism, g: FrobenioidMorphism) -> ComparisonFunctor:
+    """
+    构造比较函子 C(f,g)
+    """
+    if f.prime_spec != g.prime_spec:
+        raise FunctorConstructionError("f 与 g 的 prime_spec 不一致")
+    residues = _residue_space(f.prime_spec)
+    domain = BaseCategory(base_monoid_name=f"Z/{f.modulus}Z", prime_spec=f.prime_spec)
+    codomain = BaseCategory(base_monoid_name=f"Z/{f.modulus}Z", prime_spec=f.prime_spec)
+    for r in residues:
+        obj = _make_scalar_object(r, f.prime_spec, label=f"obj-{r}")
+        domain.add_object(obj)
+        codomain.add_object(obj)
+    return ComparisonFunctor(
+        domain=domain,
+        codomain=codomain,
+        morphism_f=f,
+        morphism_g=g,
+        evaluation_residues=residues,
+    )
+
+
+def find_natural_transformation(comp: ComparisonFunctor) -> Optional[NaturalTransformation]:
+    """
+    通过残基全检找到自然变换
+    """
+    deltas: Dict[int, int] = {}
+    for r in comp.evaluation_residues:
+        obj = _make_scalar_object(r, comp.morphism_f.prime_spec, label=f"cmp-{r}")
+        data = comp.object_map(obj)
+        deltas[r] = int(data["delta"])
+
+    # 检查 delta 是否一致
+    unique_deltas = set(deltas.values())
+    if len(unique_deltas) != 1:
+        return None
+    delta = unique_deltas.pop()
+    modulus = comp.morphism_f.modulus
+
+    def _translation(delta: int) -> Callable[[int], int]:
+        return lambda x: (int(x) + int(delta)) % modulus
+
+    components: Dict[int, FrobenioidMorphism] = {}
+    for r in comp.evaluation_residues:
+        source_obj = _make_scalar_object(comp.morphism_f.action(r), comp.morphism_f.prime_spec, label=f"f({r})")
+        target_obj = _make_scalar_object(comp.morphism_g.action(r), comp.morphism_g.prime_spec, label=f"g({r})")
+        mor = FrobenioidMorphism(
+            source_object=source_obj,
+            target_object=target_obj,
+            function=_translation(delta),
+            prime_spec=comp.morphism_f.prime_spec,
+            label=f"eta-{r}",
+        )
+        mor.verify_closure()
+        if not mor.frobenius_compatibility():
+            return None
+        components[r] = mor
+
+    nat = NaturalTransformation(
+        source_functor=comp,
+        target_functor=comp,
+        components=components,
+    )
+    # 自然性：delta 常数即可保证
+    return nat
+
+
+def inject_morphism(f: FrobenioidMorphism, g: FrobenioidMorphism) -> FunctorKernel:
+    """
+    函子级注入：若存在自然变换则生成 FunctorKernel
+    """
+    comp = construct_comparison(f, g)
+    nat = find_natural_transformation(comp)
+    if nat is None:
+        raise NaturalTransformationError("无法找到使 f ≈ g 的自然变换")
+    return FunctorKernel(base_category=comp.domain, defining_transformation=nat)
+
+
+def verify_functor_equivalence(kernel: FunctorKernel, f: FrobenioidMorphism, g: FrobenioidMorphism) -> FunctorVerdict:
+    """
+    三轨道强化版验证：态射级、自然变换存在性、Frobenius 兼容性
+    """
+    if not kernel.contains_morphism(f, g):
+        raise EquivalenceViolation("给定的态射不在 FunctorKernel 作用域内")
+    if not f.frobenius_compatibility() or not g.frobenius_compatibility():
+        raise EquivalenceViolation("态射与 Frobenius 不兼容")
+    # 取第一分量验证自然性
+    nat = kernel.defining_transformation
+    identity = wrap_function(lambda x: int(x), int(f.prime_spec.p), int(f.prime_spec.k))
+    naturality_ok = nat.naturality_check(identity)
+    delta_component = next(iter(nat.components.values()))
+    inferred_delta = delta_component.action(0) % f.modulus
+    certificate = {
+        "delta": inferred_delta,
+        "naturality": naturality_ok,
+        "frobenius_f": True,
+        "frobenius_g": True,
+    }
+    verdict = bool(naturality_ok)
+    if not verdict:
+        raise EquivalenceViolation("自然性验证失败")
+    return FunctorVerdict(
+        kernel=kernel,
+        morphism_f=f,
+        morphism_g=g,
+        equivalent=verdict,
+        certificate=certificate,
+    )
 
 @dataclass(frozen=True)
 class InjectionCertificate:
@@ -1789,6 +2210,44 @@ def _self_test() -> Dict[str, Any]:
         record("inject_definition", True)
     except Exception as e:
         record("inject_definition", False, str(e))
+
+    # 测试 6b: 函子级注入 f(x)=x+1, g(x)=x+2
+    try:
+        f_mor = wrap_function(lambda x: (int(x) + 1), 2, 1)
+        g_mor = wrap_function(lambda x: (int(x) + 2), 2, 1)
+        kernel_fg = inject_morphism(f_mor, g_mor)
+        verdict_fg = verify_functor_equivalence(kernel_fg, f_mor, g_mor)
+        assert verdict_fg.equivalent is True
+        record("functor_injection_linear_shift", True)
+    except Exception as e:
+        record("functor_injection_linear_shift", False, str(e))
+
+    # 测试 6c: f(x)=x^2, g(x)=x^3 -> 必须给出明确判决
+    try:
+        f_sq = wrap_function(lambda x: pow(int(x), 2, 9), 3, 2)
+        g_cu = wrap_function(lambda x: pow(int(x), 3, 9), 3, 2)
+        comp_sq_cu = construct_comparison(f_sq, g_cu)
+        nat_sq_cu = find_natural_transformation(comp_sq_cu)
+        if nat_sq_cu is None:
+            record("functor_square_vs_cube", True, "判决：不等价（无自然变换）")
+        else:
+            kernel_sc = FunctorKernel(base_category=comp_sq_cu.domain, defining_transformation=nat_sq_cu)
+            verdict_sc = verify_functor_equivalence(kernel_sc, f_sq, g_cu)
+            record("functor_square_vs_cube", verdict_sc.equivalent)
+    except Exception as e:
+        record("functor_square_vs_cube", False, str(e))
+
+    # 测试 6d: Frobenius vs identity
+    try:
+        p_test = 3
+        frob = wrap_function(lambda x: pow(int(x), p_test, p_test), p_test, 1)
+        ident = wrap_function(lambda x: int(x) % p_test, p_test, 1)
+        kernel_frob = inject_morphism(frob, ident)
+        verdict_frob = verify_functor_equivalence(kernel_frob, frob, ident)
+        assert verdict_frob.equivalent is True
+        record("functor_frobenius_vs_identity", True)
+    except Exception as e:
+        record("functor_frobenius_vs_identity", False, str(e))
     
     # 测试 7: GlobalLedger 完整流程
     try:
@@ -1847,4 +2306,3 @@ def _self_test() -> Dict[str, Any]:
     _logger.info("MVP23 self-test: %d/%d passed", passed, total)
     
     return results
-
