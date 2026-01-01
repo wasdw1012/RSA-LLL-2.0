@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-Norton–Salagean / Reeds–Sloane 视角下的 Chain-Ring Shift-Register Synthesis
+Norton–Salagean 算法
 ================================================================================
 
 在链环 R = Z/(p^n)Z 上，对给定有限序列 s[0..N-1]，构造（或判定不存在）
@@ -17,14 +17,14 @@ Norton–Salagean / Reeds–Sloane 视角下的 Chain-Ring Shift-Register Synthe
    - 只做：在 R 上的线性方程可解性判定 + 最小 L 选择
 2) 零因子可处理：
    - R 非域；普通 BM 在 discrepancy 需要逆元时会崩溃
-   - 这里采用 p-adic/Hensel lifting 的链环线性系统综合路线：
+   - 采用 p-adic/Hensel lifting 的链环线性系统综合路线：
      先解 mod p，再逐层提升到 mod p^n
    - 该方法严格区分：
        代数结构导致的 0（零因子现象）
        vs 精度截断导致的 0（模 p^n 归零）
 3) 必须可证最小度数：
    - 最小 L 是外层公理化最小化：从 L=0 起逐一判定线性系统是否可解
-     第一个可解的 L 就是最小度数（无任何启发式跳跃）
+     第一个可解的 L 就是最小度数
      
 - 禁止启发式：无阈值、无概率、无差不多
 - 禁止魔法数：所有常量从 p,n,N 推导或显式参数化
@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-_logger = logging.getLogger("NS-Math")
+_logger = logging.getLogger("[NS-Math]")
 
 
 # =============================================================================
@@ -682,6 +682,169 @@ def _inv_mod_unit(a: int, mod: int) -> int:
     return int(t % mm)
 
 
+# =============================================================================
+# Norton–Salagean variants: Case-3 recursive compression engine
+# =============================================================================
+
+
+class NS_Core_Engine:
+    """
+    NS_Core_Engine (variant implementation)
+
+    This class is a direct, auditable port of:
+      `core/smoke/建模稿/ns_patch.py::NS_Core_Engine`
+
+    Motivation:
+      The codebase uses multiple Norton–Salagean/BM-style variants during modeling and
+      debugging. Keeping them co-located in `norton_salagean.py` avoids divergence and
+      allows shared tooling (ring spec normalization, polynomial ops, logging).
+
+    Redlines:
+      - No heuristics / no silent fallback: invalid inputs or non-unit inverses must raise.
+      - Deterministic output: trim trailing zeros, keep coefficient normalization in Z/p^nZ.
+
+    IMPORTANT (convention warning):
+      This engine maintains a *monic* polynomial in the ring (leading coefficient 1),
+      and does NOT guarantee the "connection polynomial" normalization used by
+      `verify_connection_polynomial` (constant term 1).
+
+      If you need the standard connection polynomial over Z/p^nZ, use:
+        - `norton_salagean_bm(...)`  (default, strict)
+        - `norton_salagean_synthesize(...)`
+        - `norton_salagean_oracle_synthesize(...)`
+    """
+
+    def __init__(self, spec: ChainRingSpec):
+        if not isinstance(spec, ChainRingSpec):
+            raise TypeError(f"spec must be ChainRingSpec, got {type(spec).__name__}")
+        self.spec = spec
+        self.p = int(spec.p)
+        self.n = int(spec.n)
+        self.mod = int(spec.modulus)
+
+    def _val_unit(self, x: int) -> Tuple[int, int]:
+        """
+        Deterministic (v, u) decomposition in Z/p^nZ:
+          x = p^v * u   with u a unit if x != 0, and v in [0,n].
+        Convention:
+          - if x == 0: return (n, 1)
+        """
+        xx = int(self.spec.normalize(int(x)))
+        if xx == 0:
+            return int(self.n), 1
+        v = 0
+        p = int(self.p)
+        n = int(self.n)
+        while v < n and (xx % p == 0):
+            v += 1
+            xx //= p
+        # Unit part: reduce into canonical residue class.
+        return int(v), int(xx % self.mod)
+
+    def _poly_sub_scaled_shifted(self, f: List[int], g: List[int], factor: int, shift: int) -> List[int]:
+        """
+        f <- f - factor * T^shift * g   (mod p^n)
+        Coefficients are low->high.
+        """
+        if shift < 0:
+            raise ValueError("shift must be >= 0")
+        mod = int(self.mod)
+        term = _poly_scale(_poly_shift(g, int(shift)), int(factor), mod)
+        out = _poly_sub(list(f), term, mod)
+        return _poly_trim(out)
+
+    def solve_minimal_realization(self, sequence: Sequence[int]) -> List[int]:
+        """
+        Solve the "minimal realization" variant over Z/p^nZ.
+
+        Args:
+            sequence: s[0..N-1] (will be normalized mod p^n)
+
+        Returns:
+            Polynomial coefficients (low->high) produced by the variant update rules.
+        """
+        if not isinstance(sequence, (list, tuple)):
+            raise TypeError(f"sequence must be list/tuple, got {type(sequence).__name__}")
+
+        seq = [int(self.spec.normalize(int(x))) for x in sequence]
+        if len(seq) == 0:
+            return [1]
+
+        mod = int(self.mod)
+        p = int(self.p)
+
+        # Init:
+        # - f: current polynomial (monic in this variant sense)
+        # - g: auxiliary polynomial
+        # - (v_g, u_g, k_g): last jump state (valuation/unit/index)
+        f: List[int] = [1]
+        g: List[int] = [0]
+        v_g, u_g, k_g = int(self.n), 1, -1
+        L = 0
+
+        for k in range(len(seq)):
+            # discrepancy / delta
+            delta = 0
+            max_i = min(len(f) - 1, k)
+            for i in range(max_i + 1):
+                delta = (delta + int(f[i]) * int(seq[k - i])) % mod
+
+            v_d, u_d = self._val_unit(int(delta))
+
+            # delta == 0 in Z/p^nZ
+            if int(v_d) == int(self.n):
+                g = _poly_shift(g, 1)  # g <- T*g
+                continue
+
+            if int(v_d) >= int(v_g):
+                # Case 2: standard ideal update (v_d >= v_g)
+                # alpha = (u_d / u_g) * p^(v_d - v_g)  (mod p^n)
+                inv_u_g = _inv_mod_unit(int(u_g), mod)
+                exp = int(v_d - v_g)
+                p_pow = pow(int(p), int(exp), mod) if exp >= 0 else None
+                if p_pow is None:
+                    raise RuntimeError("internal: negative exponent in Case 2")
+                alpha = (int(u_d) * int(inv_u_g)) % mod
+                alpha = (alpha * int(p_pow)) % mod
+
+                shift = int(k - int(k_g))
+                if shift <= 0:
+                    raise RuntimeError("internal: non-positive shift in Case 2")
+                f = self._poly_sub_scaled_shifted(f, g, factor=int(alpha), shift=int(shift))
+                g = _poly_shift(g, 1)  # g <- T*g
+
+            else:
+                # Case 3: recursive compression & swap (v_d < v_g)
+                old_f = list(f)
+                # beta = (u_g / u_d) * p^(v_g - v_d) (mod p^n)
+                inv_u_d = _inv_mod_unit(int(u_d), mod)
+                exp = int(v_g - v_d)
+                p_pow = pow(int(p), int(exp), mod) if exp >= 0 else None
+                if p_pow is None:
+                    raise RuntimeError("internal: negative exponent in Case 3")
+                beta = (int(u_g) * int(inv_u_d)) % mod
+                beta = (beta * int(p_pow)) % mod
+
+                # f_new = T*f - beta*g  (all mod p^n)
+                f_shifted = _poly_shift(f, 1)
+                f = self._poly_sub_scaled_shifted(f_shifted, g, factor=int(beta), shift=0)
+
+                # Promote previous f to auxiliary base.
+                g = old_f
+                v_g, u_g, k_g = int(v_d), int(u_d), int(k)
+                L = max(int(L), int(k + 1 - int(L)))
+
+        f = [int(c % mod) for c in f]
+        f = _poly_trim(f)
+        _logger.debug(
+            "NS_Core_Engine.solve_minimal_realization: deg=%d over Z/%d^%dZ",
+            int(len(f) - 1),
+            int(self.p),
+            int(self.n),
+        )
+        return f
+
+
 @dataclass(frozen=True)
 class _Pivot:
     """
@@ -1066,6 +1229,7 @@ __all__ = [
     "ChainRingSpec",
     "LinearSystemSolution",
     "NoSolutionError",
+    "NS_Core_Engine",
     "SynthesisResult",
     "solve_linear_system_zpn",
     "verify_connection_polynomial",

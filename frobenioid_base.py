@@ -33,7 +33,7 @@ from functools import cached_property
 import hashlib
 import struct
 
-_logger = logging.getLogger("MVP0")
+_logger = logging.getLogger("[MVP0]")
 
 
 def _ensure_bridge_audit_importable() -> None:
