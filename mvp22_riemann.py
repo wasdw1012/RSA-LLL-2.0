@@ -53,34 +53,76 @@ _logger = logging.getLogger("[MVP22]")
 
 def _min_witt_length_for_bits(bits: int, p: int) -> int:
     """
-    香农-哈特利铁律: n ≥ ⌈(bits × ln(2) + S_overflow) / ln(p)⌉ + Guard_arith
-    
-      - 256 位数据 + 256 位幽灵溢出捕捉
-      - Guard_arith = 0 (由用户规格决定)
+    以纯整数方式求最小 n，使 p^n ≥ 2^(2·bits)。
+
+    - 不使用浮点/近似，避免“差不多”的精度损失。
+    - 安全余量 = 2×bits（数据 + 溢出捕捉），与函数命名明确绑定。
     """
     if not isinstance(bits, int) or bits < 1:
         raise ValueError(f"bits must be positive int, got {bits}")
     if not isinstance(p, int) or p < 2:
         raise ValueError(f"p must be int >= 2, got {p}")
-    
-    total_bits = bits + bits  # 数据 + 溢出捕捉
-    ln_2 = Fraction(693147180559945309, 1000000000000000000)  # ln(2) 精确有理数近似
-    ln_p = Fraction.from_float(math.log(p)).limit_denominator(10**18)
-    
-    raw = (total_bits * ln_2) / ln_p
-    return int(math.ceil(float(raw)))
+
+    target_bits = int(bits * 2)
+    threshold = 1 << target_bits  # 2^(2·bits)
+
+    n = 1
+    power = int(p)
+    while power < threshold:
+        n += 1
+        power *= int(p)
+    return int(n)
 
 
 def _trinity_primes() -> Tuple[int, int, int]:
     """
     三位一体素数选择 (来自 Iwasawa代数标准.txt):
       轨道 A (物理层): p=2 - EVM二进制底层
-      轨道 B (几何层): secp256k1 域素数
+      轨道 B (几何层): secp256k1 域素数 (SEC 2 原式推导，不接受替换)
       轨道 C (测试层): p=3 - Smoke Test
+
+    返回前做显式一致性验证，防止“魔法数”被静默改写。
     """
-    # secp256k1 field prime: 2^256 - 2^32 - 977 (SEC 2 标准)
-    SECP256K1_FIELD_PRIME = (1 << 256) - (1 << 32) - 977
-    return (2, SECP256K1_FIELD_PRIME, 3)
+    secp256k1_prime = (1 << 256) - (1 << 32) - 977  # 按 SEC 2 定义构造
+
+    candidates = {
+        "phys": 2,
+        "geom": secp256k1_prime,
+        "test": 3,
+    }
+
+    for label, val in candidates.items():
+        if not isinstance(val, int) or val < 2:
+            raise ValueError(f"{label} prime must be int >= 2, got {val}")
+        # 最低限度的确定性验证：排除小质因数污染，避免被误写为合数。
+        for small in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+            if val == small:
+                continue
+            if val % small == 0:
+                raise ValueError(f"{label} prime candidate {val} is divisible by {small}")
+
+    return (candidates["phys"], candidates["geom"], candidates["test"])
+
+
+# =============================================================================
+# 精确 λ 判定异常
+# =============================================================================
+
+
+class LambdaUndeterminedError(RuntimeError):
+    """
+    λ 无法在当前截断/精度下确定时抛出，禁止静默返回 None。
+
+    使用场景：
+      - 序列在当前截断窗口内呈零，无法判断最小 λ
+      - λ 超出 t_precision 截断范围
+    """
+
+    def __init__(self, message: str, *, mu: int, witt_length: int, t_precision: int) -> None:
+        super().__init__(message)
+        self.mu = int(mu)
+        self.witt_length = int(witt_length)
+        self.t_precision = int(t_precision)
 
 
 def _evm_slot_bits() -> int:
@@ -369,13 +411,23 @@ class CharacteristicPowerSeries:
         mu = int(self.mu_invariant())
 
         if mu >= n:
-            return None
+            raise LambdaUndeterminedError(
+                "lambda invariant cannot be determined: series is 0 modulo p^n in current precision",
+                mu=mu,
+                witt_length=n,
+                t_precision=m,
+            )
 
         for i in range(m):
             if int(self._vp(int(self.coefficients[i]))) == mu:
                 return int(i)
 
-        return None
+        raise LambdaUndeterminedError(
+            "lambda invariant exceeds current t_precision window; increase precision",
+            mu=mu,
+            witt_length=n,
+            t_precision=m,
+        )
     
     def weierstrass_polynomial_coeffs(self) -> Optional[List[int]]:
         """
@@ -385,8 +437,6 @@ class CharacteristicPowerSeries:
         否则返回 None.
         """
         lam = self.lambda_invariant()
-        if lam is None:
-            return None
         lam_int = int(lam)
         if lam_int == 0:
             return [1]
@@ -412,8 +462,12 @@ class CharacteristicPowerSeries:
             b.append(int((a // p_mu) % red_mod))
 
         if lam_int >= m:
-            # λ outside truncation window => cannot determine within this precision
-            return None
+            raise LambdaUndeterminedError(
+                "lambda invariant outside truncation window during Weierstrass preparation",
+                mu=mu,
+                witt_length=n,
+                t_precision=m,
+            )
 
         # ---------------------------------------------------------------------
         # Helpers over F_p[[T]] / (T^m)
@@ -2245,23 +2299,32 @@ def _self_test_mvp22() -> Dict[str, Any]:
     except Exception as e:
         record("spec_construction", False, str(e))
     
-    # 测试 3: 特征级数 μ/λ 计算
+    # 测试 3: 特征级数 μ/λ 计算（λ 必须可判定，否则抛出明确异常）
     try:
         spec = IwasawaTruncationSpec(p=2, witt_length=8, t_precision=10)
         
-        # 零级数: μ=n, λ=None
+        # 零级数: μ=n，λ 不可判定必须抛 LambdaUndeterminedError
         zero_series = CharacteristicPowerSeries.zero(spec)
         assert zero_series.mu_invariant() == 8, "Zero series μ should be n"
-        assert zero_series.lambda_invariant() is None, "Zero series λ should be None"
+        try:
+            zero_series.lambda_invariant()
+            raise AssertionError("Zero series λ must raise LambdaUndeterminedError")
+        except LambdaUndeterminedError:
+            pass
         
         # 单位级数: μ=0, λ=0
         one_series = CharacteristicPowerSeries.one(spec)
         assert one_series.mu_invariant() == 0, "One series μ should be 0"
         assert one_series.lambda_invariant() == 0, "One series λ should be 0"
         
-        # 带 p 因子的级数: μ>0
+        # 带 p 因子的级数: μ>0（λ 依赖内容，至少不应静默返回 None）
         p_series = CharacteristicPowerSeries([2, 4, 8, 0, 0, 0, 0, 0, 0, 0], spec)
         assert p_series.mu_invariant() >= 1, "p-divisible series μ should be >= 1"
+        try:
+            p_series.lambda_invariant()
+        except LambdaUndeterminedError:
+            # 允许在当前截断下不可判定，但必须以异常显式呈现
+            pass
         
         record("mu_lambda_invariants", True)
     except Exception as e:
