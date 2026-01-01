@@ -719,7 +719,7 @@ class MultivariatePolynomial:
             bad = next((v for v in values if not isinstance(v, int)), None)
             raise TypeError(f"values must be a List[int]; found {type(bad).__name__}")
 
-        # 严格模式：禁止“缺失变量自动视为 0”的静默退回。
+        # 严格模式：禁止缺失变量自动视为 0的静默退回。
         max_var_idx = -1
         for exp in self._terms.keys():
             for i, e in enumerate(exp):
@@ -767,7 +767,7 @@ class MultivariatePolynomial:
         if modulus <= 0:
             raise ValueError(f"modulus must be positive, got {modulus}")
 
-        # 严格模式：禁止“缺失变量自动视为 0”。
+        # 严格模式：禁止缺失变量自动视为 0。
         max_var_idx = -1
         for exp in self._terms.keys():
             for i, e in enumerate(exp):
@@ -1231,7 +1231,7 @@ class WittVector:
 
         关键点（这是之前版本的结构性债务来源）：
         - W_n(𝔽_p) ≅ ℤ/p^nℤ 作为环是正确的
-        - 但同构不是“把分量当作 base-p 数位直接 Σ a_i p^i”
+        - 但同构不是把分量当作 base-p 数位直接 Σ a_i p^i
         - 正确同构应使用 Teichmüller lift：
             x = (x_0,...,x_{n-1}) ↦ Σ_{i=0}^{n-1} p^i · τ_n(x_i)   (mod p^n)
           其中 τ_n: 𝔽_p → (ℤ/p^nℤ) 是 Teichmüller 提升（满足 τ_n(a)≡a (mod p) 且 τ_n(a)^p≡τ_n(a) (mod p^n)）。
@@ -1334,7 +1334,7 @@ class WittVector:
 
         数学基础：W_n(𝔽_p) ≅ ℤ/p^nℤ。
 
-        关键澄清：该同构不是“base-p 数位展开”，而是 Teichmüller 展开：
+        关键澄清：该同构不是base-p 数位展开，而是 Teichmüller 展开：
           m ≡ Σ_{i=0}^{n-1} p^i · τ_n(a_i)  (mod p^n)
         其中 a_i ∈ 𝔽_p，τ_n 是 Teichmüller lift。
 
@@ -1408,7 +1408,7 @@ class WittVector:
         这用于验证 Witt 运算的正确性：Ghost 映射是环同态。
         Returns:
             int: 返回 ℤ/p^{n+1}ℤ 的规范代表（范围 [0, p^{n+1}-1]）。
-                 这是截断 Witt 向量层级 n 的“可见精度”，也避免构造天文级整数。
+                 这是截断 Witt 向量层级 n 的可见精度，也避免构造天文级整数。
         """
         if not isinstance(n, int):
             raise TypeError(f"Ghost 分量索引必须为 int，得到 {type(n).__name__}")
@@ -1626,7 +1626,7 @@ class WittVector:
         new_components = [FiniteFieldElement.zero(self._p)] + self._components[:-1]
         result = WittVector(new_components, self._p)
 
-        # 在 W_n(𝔽_p) ≅ ℤ/p^nℤ 下：V 对应“乘以 p”。
+        # 在 W_n(𝔽_p) ≅ ℤ/p^nℤ 下：V 对应乘以 p。
         modulus = p ** length
         w_int = int(self._to_int_mod_p_power()) % modulus
         v_int = int(result._to_int_mod_p_power()) % modulus
@@ -1690,15 +1690,15 @@ def verify_witt_polynomial_consistency(
     严格验证：WittPolynomialGenerator 的加/乘多项式与 W_n(𝔽_p) ≅ ℤ/p^nℤ 的整数同构一致。
 
     重要约束（对齐你的红线规则）：
-    - 禁止启发式：不做 random sampling；该函数只做“全量穷举”验证。
-    - 禁止静默退回：若规模超出调用者允许上限，直接抛错，不做“部分抽样”。
+    - 禁止启发式：不做 random sampling；该函数只做全量穷举验证。
+    - 禁止静默退回：若规模超出调用者允许上限，直接抛错，不做部分抽样。
 
     复杂度：O((p^length)^2 · length) —— 这是数学上完整性换来的必然代价。
 
     Args:
         p: 素数特征
         length: Witt 向量长度
-        max_pair_checks: 可选的上限保护（仅用于“拒绝运行过大规模”，不是抽样）。
+        max_pair_checks: 可选的上限保护（仅用于拒绝运行过大规模，不是抽样）。
             - 若提供，且 (p^length)^2 > max_pair_checks：直接 RuntimeError 中断。
             - 若不提供：默认执行全量穷举（调用者需自行确保参数可计算）。
 
@@ -1793,8 +1793,8 @@ def verify_frobenius_verschiebung_relations(w: 'WittVector') -> Dict[str, bool]:
 
     关键澄清（避免常见误读）：
     - 在 𝔽_p 上，分量 Frobenius 满足 a^p = a，因此 **分量级** frobenius = id。
-    - 但 “FV = p” 中的 p 是 **Witt 乘法意义** 的乘以 p（在整数同构下即乘以 p mod p^n），
-      不是“分量级恒等”这么简单。
+    - 但 FV = p 中的 p 是 **Witt 乘法意义** 的乘以 p（在整数同构下即乘以 p mod p^n），
+      不是分量级恒等这么简单。
 
     Returns:
         若全部公理成立，返回包含各条关系的 dict。
@@ -2230,8 +2230,8 @@ class Prism:
           给定高度上界 H >= 0，取最小整数 k，使得 p^k > H。
           由于 Witt 截断长度至少为 1，因此 required_precision := max(1, k)。
         约束（红线）：
-        - 若 arakelov_height_bound 未提供：直接抛错，禁止静默降级到“随便给个长度”。
-        - 若当前 witt_length < required_precision：直接抛错，禁止用不足精度做“近似解”。
+        - 若 arakelov_height_bound 未提供：直接抛错，禁止静默降级到随便给个长度。
+        - 若当前 witt_length < required_precision：直接抛错，禁止用不足精度做近似解。
         """
         if self.arakelov_height_bound is None:
             raise ValueError(
@@ -2673,7 +2673,7 @@ class IntegralityValidator:
 
     def validate_witt_vector(self, w: 'WittVector') -> 'ValidationResult':
         """
-        严格验证单个 Witt 向量的“底座合法性”。
+        严格验证单个 Witt 向量的底座合法性。
 
         设计目标：
         - 作为 bonnie_clyde 中间件与上层编排器的稳定入口（不静默、不降级）
@@ -2808,7 +2808,7 @@ def strict_witt_kernel_validation(
 
     说明：
       本底座的 `WittVector.__add__` / `__mul__` 已经内建逐层 Ghost 同余验证；
-      因此“全量遍历所有 (a,b)”只要不抛错，就等价于严格通过。
+      因此全量遍历所有 (a,b)只要不抛错，就等价于严格通过。
 
     Args:
         p: 素数特征（应为 prime）
@@ -3011,8 +3011,8 @@ def run_strict_validation_suite(
     """
     运行完整的严格验证套件（确定性；部署错误必须中断）。
 
-    注意：该套件是“数学完备性优先”，会做穷举/闭环验证；调用者需自行确保参数规模可计算，
-    或通过 max_pair_checks / max_elements 设置“拒绝运行过大规模”的硬上限（不做抽样）。
+    注意：该套件是数学完备性优先，会做穷举/闭环验证；调用者需自行确保参数规模可计算，
+    或通过 max_pair_checks / max_elements 设置拒绝运行过大规模的硬上限（不做抽样）。
     """
     if witt_polynomial_max_n is None:
         witt_polynomial_max_n = int(length)
@@ -3936,7 +3936,7 @@ def iterate_keccak_mapping_orbit(
       - state_{k+1} := keccak256(key32 || state_k)   (bytes32)
       - v_{k+1} := Witt(state_{k+1})  (encoded as integer mod p^n; since state<2^256, this is a canonical embedding)
 
-    This matches the user's “decode->keccak->encode” definition and keeps Key fixed.
+    This matches the user's decode->keccak->encode definition and keeps Key fixed.
     """
     if not isinstance(v0_padic, int):
         raise TypeError(f"v0_padic must be int, got {type(v0_padic).__name__}")
@@ -4265,6 +4265,9 @@ class IwasawaTorsionCertificate:
     poly_coeffs: Tuple[int, ...]  # forward polynomial coeffs (low degree first), monic
     torsion_detected: bool
     degree_threshold: int
+    # Norton–Salagean / chain-ring synthesis evidence (deterministic, JSON-friendly).
+    # This is the audit trail that replaces the previous "BM black box".
+    synthesis_certificate: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -4281,6 +4284,7 @@ class IwasawaTorsionCertificate:
             "seed_padic": str(int(self.seed_padic)),
             "poly_degree": int(self.poly_degree),
             "poly_coeffs": [str(int(c)) for c in self.poly_coeffs],
+            "synthesis_certificate": self.synthesis_certificate,
             "torsion_detected": bool(self.torsion_detected),
             "degree_threshold": int(self.degree_threshold),
             "error": self.error,
@@ -4369,8 +4373,28 @@ def compute_iwasawa_torsion_certificate_operator_b(
             witt_length=nn,
         )
 
-        f = padic_berlekamp_massey_over_zp_power(seq=seq, p=pp, witt_length=nn)
-        deg = int(len(f) - 1)
+        # Chain-ring synthesis (Norton–Salagean / Reeds–Sloane semantics):
+        # We synthesize the minimal connection polynomial C(T)=1+...+c_L T^L over Z/p^nZ,
+        # then convert it to the forward annihilator f(T)=Σ f_i T^i (low degree first) such that:
+        #   Σ_{i=0..L} f_i * v_{k+i} ≡ 0 (mod p^n)
+        from .norton_salagean import ChainRingSpec, norton_salagean_bm
+
+        ns_spec = ChainRingSpec(p=pp, n=nn)
+        ns = norton_salagean_bm(seq, ns_spec, require_solution=True, verify_with_oracle=False)
+        if ns is None:
+            raise RuntimeError("internal: norton_salagean_bm returned None under require_solution=True")
+
+        C = list(ns.connection_polynomial)  # [1,c1,...,cL]
+        deg = int(ns.degree)
+        if len(C) != int(deg + 1):
+            raise RuntimeError("internal: Norton–Salagean connection polynomial length mismatch")
+        # forward polynomial (monic): reverse connection coefficients
+        f = list(reversed(C))
+        if not f or int(f[-1] % (pp**nn)) != 1:
+            raise RuntimeError("internal: forward polynomial must be monic (leading coeff 1)")
+
+        # Strict verification on the observation window (must abort on any mismatch).
+        verify_recurrence_over_zp_power(seq=seq, poly_f=f, p=pp, witt_length=nn)
 
         # BM reconstruct limit: deg < steps/2 indicates collapse (torsion-like)
         degree_threshold = int(int(steps) // 2)
@@ -4389,6 +4413,7 @@ def compute_iwasawa_torsion_certificate_operator_b(
             seed_padic=int(seed_padic),
             poly_degree=int(deg),
             poly_coeffs=tuple(int(c) for c in f),
+            synthesis_certificate=dict(ns.certificate),
             torsion_detected=bool(torsion_detected),
             degree_threshold=int(degree_threshold),
             error=None,
@@ -4409,6 +4434,7 @@ def compute_iwasawa_torsion_certificate_operator_b(
             seed_padic=0,
             poly_degree=-1,
             poly_coeffs=tuple(),
+            synthesis_certificate={},
             torsion_detected=False,
             degree_threshold=0,
             error=str(e),
