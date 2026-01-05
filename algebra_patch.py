@@ -2,7 +2,16 @@
 - Garcia-Stichtenoth W1 塔构造和单点 AG 代码辅助函数
 """
 
-from sage.all import GF, FunctionField, PolynomialRing, matrix, vector, ZZ
+from algebra_backend import (
+    GF,
+    FunctionField,
+    PolynomialRing,
+    frobenius_power,
+    matrix,
+    parent,
+    vector,
+    ZZ,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -14,12 +23,12 @@ def ff_trace(a, q, r):
     Tr_{F_{q^r}/F_q}(a) = sum_{i=0}^{r-1} a^{q^i}
     Exact (Frobenius powering), no blackbox.
     """
-    F = a.parent()
-    s = F.zero()
+    F = parent(a)
+    s = F.zero() if F is not None else type(a)(0)
     x = a
     for _ in range(r):
         s += x
-        x = x ** q
+        x = frobenius_power(x, q)
     return s
 
 
@@ -28,12 +37,12 @@ def ff_norm(a, q, r):
     N_{F_{q^r}/F_q}(a) = product_{i=0}^{r-1} a^{q^i}
     Exact (Frobenius powering), no blackbox.
     """
-    F = a.parent()
-    p = F.one()
+    F = parent(a)
+    p = F.one() if F is not None else type(a)(1)
     x = a
     for _ in range(r):
         p *= x
-        x = x ** q
+        x = frobenius_power(x, q)
     return p
 
 
